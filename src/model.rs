@@ -38,8 +38,10 @@ pub struct Device {
 pub struct Cover {
     pub width: u32,
     pub height: u32,
-    pub bgra: Vec<u8>,
-} // premultiplied BGRA
+    pub bgra: Vec<u8>, // premultiplied BGRA
+    /// Vibrant dominant colour (sRGB), computed once at decode; `None` for grey covers.
+    pub accent: Option<[u8; 3]>,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct MediaSnapshot {

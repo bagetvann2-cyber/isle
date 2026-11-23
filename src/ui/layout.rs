@@ -4,12 +4,20 @@ pub const PILL_H: f32 = 84.0;
 pub const EXP_H: f32 = 168.0;
 pub const GLOW: f32 = 14.0;
 pub const MIN_W: f32 = 432.0;
-pub const MAX_W: f32 = 580.0; // 3 devices with "100%" and a charging bolt each
+pub const MAX_W: f32 = 610.0; // 3 devices with "100%" and a charging bolt each, plus the waveform
 pub const MAX_DEV: usize = 3;
 pub const PAD: f32 = 24.0;
 pub const LEFT_END: f32 = 115.0; // right edge of the play/pause control
-/// Left edge of the right-hand section (track text when there are no devices).
-pub const TEXT_L: f32 = 139.0;
+/// Left edge of the right-hand section (track text when there are no devices), without / with the waveform.
+const TEXT_L: f32 = 139.0;
+const TEXT_L_WAVE: f32 = 190.0;
+/// Waveform: 6 rounded bars in the left section, `BARS_L` from the pill's left edge.
+pub const BARS: usize = 6;
+pub const BAR_W: f32 = 3.5;
+pub const BAR_GAP: f32 = 2.5;
+pub const BAR_MAX_H: f32 = 24.0;
+pub const BARS_L: f32 = LEFT_END + 18.0;
+pub const BARS_W: f32 = BARS as f32 * BAR_W + (BARS - 1) as f32 * BAR_GAP;
 pub const DEV_GAP: f32 = 34.0;
 pub const DIV_GAP: f32 = 37.0;
 pub const ICON_W: f32 = 25.0;
@@ -23,7 +31,17 @@ pub const PART_ROW_H: f32 = 28.0;
 pub const MAX_PART_ROWS: usize = 2;
 /// Room the expanded pill needs above the compact one when it opens upwards (worst case).
 pub const UP_ROOM: f32 = EXP_H - PILL_H + PART_ROW_H * MAX_PART_ROWS as f32;
+/// Room between the play control and the divider: bare, or with the waveform (18 px each side).
 const MIN_DIV_LEFT_GAP: f32 = 40.0;
+const MIN_DIV_LEFT_GAP_WAVE: f32 = 70.0;
+
+pub fn text_l(wave: bool) -> f32 {
+    if wave {
+        TEXT_L_WAVE
+    } else {
+        TEXT_L
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
@@ -49,12 +67,13 @@ impl Rect {
 }
 
 /// Pill width for the given (fully present) device item widths.
-pub fn target_width(items: &[f32]) -> f32 {
+pub fn target_width(items: &[f32], wave: bool) -> f32 {
     if items.is_empty() {
         return MIN_W;
     }
     let n = items.len() as f32;
-    let need = LEFT_END + MIN_DIV_LEFT_GAP + 1.0 + DIV_GAP + items.iter().sum::<f32>() + DEV_GAP * (n - 1.0) + PAD;
+    let gap = if wave { MIN_DIV_LEFT_GAP_WAVE } else { MIN_DIV_LEFT_GAP };
+    let need = LEFT_END + gap + 1.0 + DIV_GAP + items.iter().sum::<f32>() + DEV_GAP * (n - 1.0) + PAD;
     need.clamp(MIN_W, MAX_W)
 }
 
@@ -129,10 +148,15 @@ mod tests {
 
     #[test]
     fn widths() {
-        assert_eq!(target_width(&[]), MIN_W);
-        assert_eq!(target_width(&[69.0, 69.0]), MIN_W);
-        assert!(target_width(&[95.0, 95.0, 95.0]) > MIN_W);
-        assert!(target_width(&[95.0, 95.0, 95.0]) <= MAX_W);
+        for wave in [false, true] {
+            assert_eq!(target_width(&[], wave), MIN_W);
+            assert_eq!(target_width(&[69.0, 82.0], wave), MIN_W); // 78% + charging 92%
+            assert!(target_width(&[95.0, 95.0, 95.0], wave) > MIN_W);
+            assert!(target_width(&[95.0, 95.0, 95.0], wave) <= MAX_W);
+        }
+        // The waveform needs its own room only when devices crowd the pill.
+        assert!(target_width(&[95.0, 95.0, 95.0], true) > target_width(&[95.0, 95.0, 95.0], false));
+        assert!(BARS_L + BARS_W < text_l(true));
     }
 
     #[test]

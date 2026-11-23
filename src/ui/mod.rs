@@ -7,7 +7,7 @@
 pub mod layout;
 mod render;
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicPtr, AtomicU32, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -28,12 +28,13 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::anim::{Spring, Tween};
+use crate::audio::Meter;
 use crate::battery::BatteryHandle;
 use crate::media::MediaHandle;
 use crate::model::{Cover, Device, MediaCommand, MediaSnapshot, Part, PartKind};
 use crate::settings;
 use layout::*;
-use render::{Ctl, DevDraw, Frame, PartsRow, Renderer};
+use render::{Ctl, DevDraw, Frame, PartsRow, Renderer, WaveDraw};
 
 pub const WM_APP_MEDIA: u32 = WM_APP + 1;
 pub const WM_APP_DEVICES: u32 = WM_APP + 2;
@@ -44,6 +45,16 @@ const WM_APP_TRAY: u32 = WM_APP + 7;
 static WM_TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 const WM_APP_FRAME: u32 = WM_APP + 3;
 const WM_APP_FOREGROUND: u32 = WM_APP + 4;
+const WM_APP_WAVE: u32 = WM_APP + 8;
+
+/// Waveform pacing, shared with the `wave` helper thread: it posts `WM_APP_WAVE` every ~33 ms
+/// (`WAVE_FAST`, bars moving) or every 150 ms (`WAVE_POLL`, playing but silent) and parks on `WAVE_OFF`.
+static WAVE_MODE: AtomicU8 = AtomicU8::new(WAVE_OFF);
+const WAVE_OFF: u8 = 0;
+const WAVE_POLL: u8 = 1;
+const WAVE_FAST: u8 = 2;
+/// How often the audio level is sampled (bar targets are refreshed at this rate).
+const WAVE_SAMPLE: Duration = Duration::from_millis(110);
 
 const T_PROGRESS: usize = 2;
 const T_LEAVE: usize = 3;
@@ -166,6 +177,19 @@ struct App {
     perf: (u32, f64, f64),
     perf_present: f64,
 
+    // waveform
+    wave_on: bool,
+    bars: [Spring; BARS],
+    /// What the DIB currently shows, to skip identical frames.
+    wave_drawn: [f32; BARS],
+    wave_t: Instant,
+    wave_sample_at: Instant,
+    wave_silent: u32,
+    wave_rng: u32,
+    wave_perf: (u32, f64, f64),
+    meter: Meter,
+    wave_thread: Option<std::thread::Thread>,
+
     // interaction
     want_exp: bool,
     tracking: bool,
@@ -248,6 +272,16 @@ impl App {
             frame_tx: None,
             perf: (0, 0.0, 0.0),
             perf_present: 0.0,
+            wave_on: settings::waveform(),
+            bars: [Spring::new(0.0, 0.16, 0.6); BARS],
+            wave_drawn: [0.0; BARS],
+            wave_t: now,
+            wave_sample_at: now,
+            wave_silent: 0,
+            wave_rng: 0x9E37_79B9,
+            wave_perf: (0, 0.0, 0.0),
+            meter: Meter::default(),
+            wave_thread: None,
             want_exp: false,
             tracking: false,
             leave_pending: false,
@@ -413,11 +447,15 @@ impl App {
         self.frame_pending = false;
         let now = Instant::now();
         self.tick(now);
+        if self.wave_visible() {
+            self.wave_step(now);
+        }
         self.paint();
         if self.is_animating(now) {
             self.kick();
         } else {
             self.anim_running = false;
+            self.sync_wave();
             self.log_perf();
             if !self.trimmed {
                 self.trimmed = true;
@@ -433,13 +471,157 @@ impl App {
         if n == 0 || !test_knob("ISLE_PERF") {
             return;
         }
-        if let Some(dir) = std::env::var_os("TEMP") {
-            let line = format!("frames {n} avg {:.3} ms (present {:.3}) max {:.3} ms\n", sum / n as f64, present / n as f64, max);
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(std::path::Path::new(&dir).join("isle-perf.log"))
-                .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+        perf_log(&format!("frames {n} avg {:.3} ms (present {:.3}) max {:.3} ms\n", sum / n as f64, present / n as f64, max));
+    }
+
+    // ---- waveform ----
+
+    fn playing(&self) -> bool {
+        self.media.as_ref().is_some_and(|m| m.playing)
+    }
+
+    /// The bars are on screen (or about to be): enabled, island shown and not on its way out, media present.
+    fn wave_visible(&self) -> bool {
+        self.wave_on && self.shown && self.vis.target > 0.0 && self.media.is_some()
+    }
+
+    fn wave_moving(&self) -> bool {
+        self.bars.iter().any(|b| b.target > 0.0 || !b.settled(0.004, 0.02))
+    }
+
+    /// Set the helper thread's cadence: fast while bars move, slow while playing silently
+    /// (to notice sound starting), parked otherwise. Hidden / disabled also zeroes the bars.
+    fn sync_wave(&mut self) {
+        let visible = self.wave_visible();
+        let mode = if !visible {
+            WAVE_OFF
+        } else if self.wave_moving() {
+            WAVE_FAST
+        } else if self.playing() {
+            WAVE_POLL
+        } else {
+            WAVE_OFF
+        };
+        if !visible {
+            self.bars.iter_mut().for_each(|b| (b.target, b.x, b.v) = (0.0, 0.0, 0.0));
+            self.wave_drawn = [0.0; BARS];
+            self.meter.reset(); // endpoint is looked up afresh next time (device may have changed)
+        }
+        if WAVE_MODE.swap(mode, Ordering::Relaxed) == WAVE_OFF && mode != WAVE_OFF {
+            self.wave_t = Instant::now();
+            self.wave_sample_at = self.wave_t;
+            if let Some(t) = &self.wave_thread {
+                t.unpark();
+            }
+        }
+    }
+
+    fn rand01(&mut self) -> f32 {
+        let mut x = self.wave_rng;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.wave_rng = x;
+        (x >> 8) as f32 / (1u32 << 24) as f32
+    }
+
+    /// Advance the bar springs; every `WAVE_SAMPLE` read the audio level and pick new bar targets.
+    fn wave_step(&mut self, now: Instant) {
+        let dt = now.saturating_duration_since(self.wave_t).as_secs_f32();
+        self.wave_t = now;
+        if self.playing() && now >= self.wave_sample_at {
+            self.wave_sample_at = now + WAVE_SAMPLE;
+            let peak = if test_knob("ISLE_TEST_WAVE") { 0.1 + 0.5 * self.rand01() } else { self.meter.peak() };
+            if peak < 0.01 {
+                self.wave_silent = self.wave_silent.saturating_add(1);
+                if self.wave_silent == 12 {
+                    self.meter.reset(); // silence for a while: maybe the default device changed
+                }
+                self.bars.iter_mut().for_each(|b| b.target = 0.0);
+            } else {
+                self.wave_silent = 0;
+                // Peak -> 0..1 on a dB scale (-36 dB and below is flat), then a random share per bar.
+                let level = ((20.0 * peak.log10() + 36.0) / 36.0).clamp(0.0, 1.0);
+                for i in 0..BARS {
+                    let r = 0.3 + 0.7 * self.rand01();
+                    self.bars[i].target = level * r;
+                }
+            }
+        } else if !self.playing() {
+            self.bars.iter_mut().for_each(|b| b.target = 0.0);
+        }
+        for b in &mut self.bars {
+            b.step(dt);
+            if b.target == 0.0 && b.settled(0.004, 0.02) {
+                b.snap();
+            }
+        }
+    }
+
+    /// Bars-only frame from the helper thread's cadence. Skipped while a regular animation
+    /// runs (its frames carry the bars) and when nothing moved.
+    fn on_wave(&mut self) {
+        if self.anim_running {
+            return;
+        }
+        let now = Instant::now();
+        if self.is_animating(now) {
+            self.kick();
+            return;
+        }
+        if self.wave_visible() {
+            self.wave_step(now);
+            if self.bars.iter().zip(&self.wave_drawn).any(|(b, d)| (b.x - d).abs() > 0.002) {
+                self.paint_wave();
+            }
+        }
+        self.sync_wave();
+    }
+
+    fn wave_draw(&self, now: Instant) -> Option<WaveDraw> {
+        let m = self.media.as_ref().filter(|_| self.wave_on)?;
+        let cur = m.cover.as_ref().and_then(|c| c.accent);
+        let prev = self.prev_cover.as_ref().and_then(|c| c.accent);
+        let t = self.cover_t.val(now);
+        let rgb = match (prev, cur) {
+            (Some(p), Some(c)) if t < 1.0 => Some([0, 1, 2].map(|i| (p[i] as f32 + (c[i] as f32 - p[i] as f32) * t).round() as u8)),
+            _ => cur,
+        };
+        Some(WaveDraw { h: self.bars.map(|b| b.x.clamp(0.0, 1.0)), rgb })
+    }
+
+    fn paint_wave(&mut self) {
+        if !self.shown {
+            return;
+        }
+        let t0 = Instant::now();
+        let (pill, _, _, row1, _) = self.geometry();
+        let (Some(w), Some(mut r)) = (self.wave_draw(t0), self.r.take()) else { return };
+        if !r.draw_wave(self.scale, pill.l, row1 + PILL_H / 2.0, &w) {
+            self.r = Some(r);
+            self.paint(); // no DIB to draw into: take the full path
+            return;
+        }
+        let t1 = Instant::now();
+        r.present(self.hwnd, self.win_x, self.win_y());
+        self.r = Some(r);
+        self.wave_drawn = w.h;
+        if test_knob("ISLE_PERF") {
+            let (ms, pr) = (t0.elapsed().as_secs_f64() * 1000.0, t1.elapsed().as_secs_f64() * 1000.0);
+            let p = &mut self.wave_perf;
+            *p = (p.0 + 1, p.1 + ms, p.2.max(ms));
+            self.perf_present += pr;
+            if self.wave_perf.0 == 100 {
+                let (n, sum, max) = std::mem::take(&mut self.wave_perf);
+                let line = format!(
+                    "wave frames {n} avg {:.3} ms (present {:.3}) max {:.3} ms\n",
+                    sum / n as f64,
+                    self.perf_present / n as f64,
+                    max
+                );
+                self.perf_present = 0.0;
+                perf_log(&line);
+            }
         }
     }
 
@@ -521,6 +703,8 @@ impl App {
             rows_f: self.rows_t.val(now),
             press: self.press_ctl.map(|c| (c, self.press.x)),
             progress,
+            text_l: text_l(self.wave_on && self.media.is_some()),
+            wave: self.wave_draw(now),
         }
     }
 
@@ -542,6 +726,7 @@ impl App {
         }
         let t0 = Instant::now();
         let f = self.frame(t0);
+        self.wave_drawn = self.bars.map(|b| b.x.clamp(0.0, 1.0));
         let Some(mut r) = self.r.take() else { return };
         if r.size() != (self.win_w, self.win_h) {
             let _ = r.resize(self.win_w, self.win_h);
@@ -830,6 +1015,7 @@ impl App {
         };
         self.media = new;
         self.sync_progress_timer();
+        self.sync_wave();
         if self.is_animating(now) {
             if self.shown {
                 self.kick();
@@ -939,9 +1125,7 @@ impl App {
             }
         }
         self.devs = out;
-        let items: Vec<f32> = self.shown_devs().filter(|d| !d.removing).map(|d| d.full_w()).collect();
-        self.width.target = target_width(&items);
-        self.width.tune(0.40, 0.80);
+        self.update_width_target();
         let rows = self.devs.iter().filter(|d| !d.removing && !d.dev.parts.is_empty()).count().min(MAX_PART_ROWS) as f32;
         if self.rows_t.target() != rows {
             self.rows_t.go(rows, 0.25, now);
@@ -950,6 +1134,12 @@ impl App {
         if self.shown {
             self.kick();
         }
+    }
+
+    fn update_width_target(&mut self) {
+        let items: Vec<f32> = self.shown_devs().filter(|d| !d.removing).map(|d| d.full_w()).collect();
+        self.width.target = target_width(&items, self.wave_on);
+        self.width.tune(0.40, 0.80);
     }
 
     // ---- system events ----
@@ -998,6 +1188,7 @@ impl App {
         } else {
             self.vis.target = 0.0;
         }
+        self.sync_wave();
         self.kick();
     }
 
@@ -1113,6 +1304,17 @@ fn trim_memory() {
     }
 }
 
+/// Append a line to `%TEMP%\isle-perf.log` (callers gate this on the `ISLE_PERF` test knob).
+fn perf_log(line: &str) {
+    if let Some(dir) = std::env::var_os("TEMP") {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::path::Path::new(&dir).join("isle-perf.log"))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    }
+}
+
 /// Test switches (env vars) only exist in debug builds; release builds ignore them.
 fn test_knob(name: &str) -> bool {
     cfg!(debug_assertions) && std::env::var_os(name).is_some()
@@ -1219,17 +1421,19 @@ unsafe extern "system" fn mouse_ll(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
 
 unsafe fn show_menu(hwnd: HWND) {
     let ru = app().ru;
-    let (t_auto, t_reset, t_exit, t_vis) = if ru {
-        ("Запускать вместе с Windows", "Сбросить позицию", "Выход", "Всегда показывать")
+    let (t_auto, t_reset, t_exit, t_vis, t_wave) = if ru {
+        ("Запускать вместе с Windows", "Сбросить позицию", "Выход", "Всегда показывать", "Показывать волну")
     } else {
-        ("Start with Windows", "Reset position", "Exit", "Always visible")
+        ("Start with Windows", "Reset position", "Exit", "Always visible", "Show waveform")
     };
     let Ok(menu) = CreatePopupMenu() else { return };
-    let (a, b, c, d) = (wide0(t_auto), wide0(t_reset), wide0(t_exit), wide0(t_vis));
+    let (a, b, c, d, e) = (wide0(t_auto), wide0(t_reset), wide0(t_exit), wide0(t_vis), wide0(t_wave));
     let flags = if settings::autostart_enabled() { MF_STRING | MF_CHECKED } else { MF_STRING };
     let _ = AppendMenuW(menu, flags, 1, PCWSTR(a.as_ptr()));
     let vflags = if app().always_visible { MF_STRING | MF_CHECKED } else { MF_STRING };
     let _ = AppendMenuW(menu, vflags, 4, PCWSTR(d.as_ptr()));
+    let wflags = if app().wave_on { MF_STRING | MF_CHECKED } else { MF_STRING };
+    let _ = AppendMenuW(menu, wflags, 5, PCWSTR(e.as_ptr()));
     let _ = AppendMenuW(menu, MF_STRING, 2, PCWSTR(b.as_ptr()));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, 3, PCWSTR(c.as_ptr()));
@@ -1254,6 +1458,14 @@ unsafe fn show_menu(hwnd: HWND) {
                 SetTimer(Some(hwnd), T_HIDE, 600, None);
             }
             a.apply_visibility();
+        }
+        5 => {
+            a.wave_on = !a.wave_on;
+            settings::set_waveform(a.wave_on);
+            a.update_width_target();
+            a.update_zone();
+            a.sync_wave();
+            a.kick();
         }
         3 => {
             let _ = DestroyWindow(hwnd);
@@ -1343,6 +1555,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_APP_FRAME => {
             app().on_frame();
+            LRESULT(0)
+        }
+        WM_APP_WAVE => {
+            app().on_wave();
             LRESULT(0)
         }
         WM_APP_MEDIA => {
@@ -1459,6 +1675,21 @@ pub fn run() -> windows::core::Result<()> {
             })
             .ok();
         a0.frame_tx = Some(tx);
+        a0.wave_thread = std::thread::Builder::new()
+            .name("wave".into())
+            .spawn(move || loop {
+                match WAVE_MODE.load(Ordering::Relaxed) {
+                    WAVE_OFF => std::thread::park(),
+                    m => {
+                        std::thread::sleep(Duration::from_millis(if m == WAVE_FAST { 33 } else { 150 }));
+                        if WAVE_MODE.load(Ordering::Relaxed) != WAVE_OFF {
+                            let _ = PostMessageW(Some(HWND(hw as *mut _)), WM_APP_WAVE, WPARAM(0), LPARAM(0));
+                        }
+                    }
+                }
+            })
+            .ok()
+            .map(|h| h.thread().clone());
         let sh = shared.clone();
         a0.battery = Some(crate::battery::spawn(Box::new(move |devs| {
             if let Ok(mut g) = sh.devices.lock() {

@@ -1,6 +1,8 @@
 #![windows_subsystem = "windows"]
 
+mod accent;
 mod anim;
+mod audio;
 mod battery;
 mod media;
 mod model;

@@ -1,4 +1,4 @@
-//! Registry-backed settings: window position and autostart.
+//! Registry-backed settings: window position, autostart and display flags.
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::ERROR_SUCCESS;
@@ -84,4 +84,13 @@ pub fn always_visible() -> bool {
 
 pub fn set_always_visible(on: bool) {
     set_u32(w!("always_visible"), on as u32);
+}
+
+/// The audio waveform next to the play control; on by default.
+pub fn waveform() -> bool {
+    get_u32(w!("waveform")).unwrap_or(1) != 0
+}
+
+pub fn set_waveform(on: bool) {
+    set_u32(w!("waveform"), on as u32);
 }

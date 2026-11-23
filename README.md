@@ -8,6 +8,7 @@ A tiny Dynamic-Island-style pill for Windows: what's playing, and the battery of
 ## Features
 
 - **Media**: cover, title, artist, progress and play / pause / prev / next for any app that shows up in the Windows media controls (Spotify, Yandex Music, browsers, Media Player...).
+- **Waveform**: six bars next to the play control that move with the sound actually coming out of your speakers, tinted with the cover's colour (grey when there is no cover). Switch it off in the menu.
 - **Batteries**: wireless headphones, earbuds (left / right / case), mice, keyboards. Percent turns green with a bolt while charging, red at 15% or less.
 - **Hover** to expand, **drag** to move it, **right-click** (or the tray icon) for the menu.
 - **Auto-hide**: invisible and click-through until the cursor comes near it. Hides while a fullscreen app is in front.
@@ -33,7 +34,8 @@ Earbud parts come from a short passive Bluetooth scan that runs when the island 
 
 Measured on Windows 11 at 125% scaling:
 
-- idle CPU: about 0% (0 ms over 20 s, visible or hidden)
+- idle CPU: about 0% (0 ms over 20 s, visible or hidden, nothing playing or paused)
+- waveform, island visible and music playing: about 1% of one core (a bars-only frame costs about 0.2 ms, drawn at about 30 fps, plus a level read about 10 times a second); a silent track that is "playing": about 0.3% (the level is polled every 150 ms); island hidden while music plays: about 0% (under one 16 ms scheduler tick over 20 s); paused: 0 ms
 - private memory: about 11-12 MB
 - `isle.exe`: about 0.65 MB
 - animation frame: about 1.5-2 ms (render + present); no frames and no timers when nothing moves
@@ -47,7 +49,7 @@ Download `isle.exe` from the Releases page and run it. It is unsigned, so Window
 - Move the cursor near the top-center of the screen to reveal it; hover the pill to expand it.
 - Click the cover for next track, the play / pause glyph to toggle.
 - Drag to reposition (saved); "Reset position" in the menu puts it back.
-- Right-click the pill or the tray icon: **Start with Windows**, **Always visible** (turns auto-hide off), **Reset position**, **Exit**. Left-clicking the tray icon shows the island for a few seconds.
+- Right-click the pill or the tray icon: **Start with Windows**, **Always visible** (turns auto-hide off), **Show waveform**, **Reset position**, **Exit**. Left-clicking the tray icon shows the island for a few seconds.
 
 ## Build from source
 
@@ -66,7 +68,7 @@ A source is one module in `src/battery/` with `fn poll() -> Vec<Device>` (see `b
 
 ## Privacy
 
-No network access. It reads device batteries and the Windows media session, nothing else, and writes nothing to your devices (the Logitech source sends read-only queries). Position and the always-visible flag live in `HKCU\Software\isle`; autostart is the `isle` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+No network access. It reads device batteries, the Windows media session and the output peak level of your default playback device (a single number from the Windows audio meter, used for the waveform; it never records or reads audio), nothing else, and writes nothing to your devices (the Logitech source sends read-only queries). Position, the always-visible flag and the waveform flag live in `HKCU\Software\isle`; autostart is the `isle` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 
 To know when the cursor approaches the island, isle installs a global low-level mouse hook (`WH_MOUSE_LL`). It only compares the cursor position with a small rectangle and posts a message when the cursor enters or leaves it; it reads nothing else and logs nothing. The hook is removed while a fullscreen app is in front and when "Always visible" is on.
 
@@ -78,9 +80,9 @@ Matching a Fast Pair or AirPods advert to your headset is heuristic (signal stre
 
 - Запустите `isle.exe` из Releases. Файл не подписан: в SmartScreen нажмите «Подробнее» → «Выполнить в любом случае».
 - Капсула прячется и появляется, когда курсор рядом. Наведите курсор, чтобы раскрыть. Перетаскивайте мышью.
-- Правый клик по капсуле или значку в трее: «Запускать вместе с Windows», «Всегда показывать», «Сбросить позицию», «Выход».
+- Правый клик по капсуле или значку в трее: «Запускать вместе с Windows», «Всегда показывать», «Показывать волну», «Сбросить позицию», «Выход».
 - Чтобы понять, что курсор рядом, используется глобальный хук мыши (только позиция курсора, ничего не логируется). Антивирус или античит могут ругаться на неподписанное приложение с таким хуком.
-- Нагрузка: около 0% CPU в покое, около 11-12 МБ памяти, файл около 0,65 МБ. Сети нет, устройства только читаются.
+- Нагрузка: около 0% CPU в покое, около 1% одного ядра при видимой капсуле и играющей музыке (волна), около 11-12 МБ памяти, файл около 0,65 МБ. Сети нет, устройства только читаются.
 - Сборка: Rust (`x86_64-pc-windows-gnu`) и MinGW-w64, затем `cargo build --release`.
 
 ## License

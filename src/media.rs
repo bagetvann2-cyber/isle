@@ -305,6 +305,7 @@ fn decode(f: &IWICImagingFactory, bytes: &[u8]) -> windows::core::Result<Cover> 
         };
         let mut bgra = vec![0u8; (tw * th * 4) as usize];
         src.CopyPixels(std::ptr::null(), tw * 4, &mut bgra)?;
-        Ok(Cover { width: tw, height: th, bgra })
+        let accent = crate::accent::pick(&bgra);
+        Ok(Cover { width: tw, height: th, bgra, accent })
     }
 }

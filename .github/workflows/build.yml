@@ -13,7 +13,7 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # windows-latest defaults to the msvc host: install the gnu-host toolchain itself
       # (with its own clippy/rustfmt) and make it the default.
@@ -62,7 +62,7 @@ jobs:
           mkdir dist
           cp target/release/isle.exe dist/isle.exe
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: isle
           path: dist/isle.exe
@@ -75,13 +75,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: isle
           path: dist
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/isle.exe
           generate_release_notes: true

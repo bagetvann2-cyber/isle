@@ -51,6 +51,12 @@ pub enum Ctl {
     Next,
 }
 
+/// Waveform state: bar heights 0..1 and the (cover-derived) base colour; `None` = neutral grey.
+pub struct WaveDraw {
+    pub h: [f32; BARS],
+    pub rgb: Option<[u8; 3]>,
+}
+
 pub struct Frame {
     pub s: f32,
     pub pill: Rect,
@@ -79,6 +85,9 @@ pub struct Frame {
     pub rows_f: f32,
     pub press: Option<(Ctl, f32)>,
     pub progress: Option<(f32, String, String)>,
+    /// Left edge of the right-hand text section (it moves right to make room for the waveform).
+    pub text_l: f32,
+    pub wave: Option<WaveDraw>,
 }
 
 /// Text layout reused until its string, format or box size changes.
@@ -112,7 +121,7 @@ fn placeholder_cover() -> Arc<Cover> {
             bgra.extend_from_slice(&[c, c, c.saturating_add(2), 255]);
         }
     }
-    Arc::new(Cover { width: N, height: N, bgra })
+    Arc::new(Cover { width: N, height: N, bgra, accent: None })
 }
 
 pub struct Renderer {
@@ -695,11 +704,14 @@ impl Renderer {
         self.play_pause(g.pp1.0, g.pp1.1, 20.0, pause_w, a, pp);
 
         let cy = f.row1 + PILL_H / 2.0;
+        if let Some(w) = &f.wave {
+            self.bars(f.pill.l, cy, w);
+        }
         // Right section without devices: the current track (or the empty state).
         let dev_presence = f.devs.iter().map(|d| d.e).fold(0.0f32, f32::max);
         let ta = (1.0 - dev_presence).clamp(0.0, 1.0) * (1.0 - f.content).clamp(0.0, 1.0);
         if ta > 0.01 {
-            let (l, r) = (f.pill.l + TEXT_L, f.pill.r - PAD);
+            let (l, r) = (f.pill.l + f.text_l, f.pill.r - PAD);
             if f.has_media {
                 let tr = Rect { l, t: cy - 21.0, r, b: cy + 1.0 };
                 let ar = Rect { l, t: cy + 1.0, r, b: cy + 19.0 };
@@ -752,6 +764,76 @@ impl Renderer {
         let left = cursor + DEV_GAP * last_e;
         let dx = (left - DIV_GAP).floor() + 0.5;
         self.fill(Rect::around(dx, cy, 1.0, 36.0), 0.0, 0xFFFFFF, 0.10 * presence.clamp(0.0, 1.0));
+    }
+
+    /// Two tones of the waveform: the accent (or neutral grey) and a lighter variant, as 0xRRGGBB.
+    fn bar_tones(w: &WaveDraw) -> [u32; 2] {
+        let pack = |c: [u8; 3]| (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32;
+        match w.rgb {
+            Some(c) => [pack(c), pack(c.map(|v| v + ((255 - v) as f32 * 0.4) as u8))],
+            None => [0x8E8E93; 2],
+        }
+    }
+
+    /// The waveform: `BARS` rounded bars centred on `cy`, alternating the two tones.
+    fn bars(&self, left: f32, cy: f32, w: &WaveDraw) {
+        let tones = Self::bar_tones(w);
+        for (i, v) in w.h.iter().enumerate() {
+            let h = BAR_W + (BAR_MAX_H - BAR_W) * v.clamp(0.0, 1.0);
+            let x = left + BARS_L + i as f32 * (BAR_W + BAR_GAP);
+            self.fill(Rect::new(x, cy - h / 2.0, BAR_W, h), BAR_W / 2.0, tones[i % 2], 1.0);
+        }
+    }
+
+    /// Redraw only the waveform over the settled pill, straight into the window's DIB, and mark
+    /// just that rectangle changed. A Direct2D pass (~1 ms of software rendering) would cost more
+    /// than the whole job: the region is ~800 px and the pill behind it is opaque black.
+    /// Valid only when nothing else moves (scale 1, full opacity); the next full frame redraws
+    /// the region from scratch, so the WIC bitmap does not need to see these pixels.
+    pub fn draw_wave(&mut self, s: f32, left: f32, cy: f32, w: &WaveDraw) -> bool {
+        if self.bits.is_null() {
+            return false;
+        }
+        let rc = RECT {
+            left: (((left + BARS_L) * s).floor() as i32 - 1).clamp(0, self.w),
+            top: (((cy - BAR_MAX_H / 2.0) * s).floor() as i32 - 1).clamp(0, self.h),
+            right: (((left + BARS_L + BARS_W) * s).ceil() as i32 + 1).clamp(0, self.w),
+            bottom: (((cy + BAR_MAX_H / 2.0) * s).ceil() as i32 + 1).clamp(0, self.h),
+        };
+        let tones = Self::bar_tones(w).map(|c| [(c >> 16 & 255) as f32, (c >> 8 & 255) as f32, (c & 255) as f32]);
+        let hw = BAR_W * s / 2.0;
+        // (centre x, half of the straight part, tone) per bar, in physical px.
+        let bars: [(f32, f32, [f32; 3]); BARS] = std::array::from_fn(|i| {
+            let hh = (BAR_W + (BAR_MAX_H - BAR_W) * w.h[i].clamp(0.0, 1.0)) * s / 2.0;
+            ((left + BARS_L) * s + hw + i as f32 * (BAR_W + BAR_GAP) * s, (hh - hw).max(0.0), tones[i % 2])
+        });
+        let cyp = cy * s;
+        for y in rc.top..rc.bottom {
+            let py = y as f32 + 0.5;
+            for x in rc.left..rc.right {
+                let px = x as f32 + 0.5;
+                let mut rgb = [0.0f32; 3];
+                for (cx, seg, tone) in &bars {
+                    let (dx, dy) = ((px - cx).abs(), ((py - cyp).abs() - seg).max(0.0));
+                    // Capsule distance: coverage 1 inside, 0 half a pixel outside.
+                    let cov = (0.5 - ((dx * dx + dy * dy).sqrt() - hw)).clamp(0.0, 1.0);
+                    for k in 0..3 {
+                        rgb[k] += tone[k] * cov;
+                    }
+                }
+                let o = (y as usize * self.w as usize + x as usize) * 4;
+                // SAFETY: rc is clamped to the DIB, which holds w * h BGRA pixels.
+                unsafe {
+                    let d = self.bits.add(o);
+                    *d = rgb[2] as u8;
+                    *d.add(1) = rgb[1] as u8;
+                    *d.add(2) = rgb[0] as u8;
+                    *d.add(3) = 255;
+                }
+            }
+        }
+        self.changed = rc;
+        true
     }
 
     fn block(&self, f: &Frame, g: &Geo) {
