@@ -1,0 +1,88 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # windows-latest defaults to the msvc host: install the gnu-host toolchain itself
+      # (with its own clippy/rustfmt) and make it the default.
+      - name: Install Rust (gnu host)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal --component clippy,rustfmt
+          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed" }
+          rustup default stable-x86_64-pc-windows-gnu
+          if ($LASTEXITCODE -ne 0) { throw "rustup default failed" }
+          rustc -vV
+          if ($LASTEXITCODE -ne 0) { throw "rustc not usable" }
+
+      # raw-dylib imports need a full MinGW (dlltool + as); the runner image normally has one.
+      - name: MinGW-w64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) {
+            choco install mingw -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install mingw failed" }
+            "C:\ProgramData\mingw64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+            $env:Path = "C:\ProgramData\mingw64\mingw64\bin;$env:Path"
+          }
+          gcc --version
+          if ($LASTEXITCODE -ne 0) { throw "gcc not found" }
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --release -- -D warnings
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Collect artifact
+        shell: bash
+        run: |
+          mkdir dist
+          cp target/release/isle.exe dist/isle.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: isle
+          path: dist/isle.exe
+
+  # Only this job can write to the repository (create the release).
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: isle
+          path: dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/isle.exe
+          generate_release_notes: true
+          prerelease: true
