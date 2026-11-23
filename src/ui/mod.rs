@@ -29,7 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::anim::{Spring, Tween};
 use crate::audio::Meter;
-use crate::battery::BatteryHandle;
+use crate::battery::{BatteryHandle, LiveMode};
 use crate::media::MediaHandle;
 use crate::model::{Cover, Device, MediaCommand, MediaSnapshot, Part, PartKind};
 use crate::settings;
@@ -144,7 +144,6 @@ struct App {
     shared: Arc<Shared>,
     media_tx: Option<MediaHandle>,
     battery: Option<BatteryHandle>,
-    last_scan: Option<Instant>,
     r: Option<Renderer>,
     ru: bool,
 
@@ -244,7 +243,6 @@ impl App {
             shared,
             media_tx: None,
             battery: None,
-            last_scan: None,
             r: None,
             ru,
             scale: dpi as f32 / 96.0 * UI_SCALE,
@@ -809,18 +807,24 @@ impl App {
             }
             self.open.target = 1.0;
             self.open.tune(0.42, 0.78);
-            // Earbud L/R/case levels come from a short BLE scan; the worker serialises scans,
-            // this just keeps us from asking more than every 30 s.
-            if self.last_scan.is_none_or(|t| now.duration_since(t) > Duration::from_secs(30)) {
-                self.last_scan = Some(now);
-                if let Some(b) = &self.battery {
-                    b.scan_buds();
-                }
-            }
         }
+        self.sync_live();
         self.sync_progress_timer();
         self.update_zone();
         self.kick();
+    }
+
+    /// Earbud L/R/case levels come from a BLE watcher in the battery worker: continuous
+    /// while expanded, duty-cycled while merely shown, off while hidden.
+    fn sync_live(&self) {
+        let mode = match (self.shown && self.vis.target > 0.0, self.want_exp) {
+            (false, _) => LiveMode::Off,
+            (true, false) => LiveMode::Duty,
+            (true, true) => LiveMode::Continuous,
+        };
+        if let Some(b) = &self.battery {
+            b.set_live(mode);
+        }
     }
 
     fn request_collapse(&mut self, now: Instant) {
@@ -828,6 +832,7 @@ impl App {
             return;
         }
         self.want_exp = false;
+        self.sync_live();
         self.content.go(0.0, 0.10, now);
         self.collapse_at = Some(now + Duration::from_millis(90));
         self.sync_progress_timer();
@@ -1189,6 +1194,7 @@ impl App {
             self.vis.target = 0.0;
         }
         self.sync_wave();
+        self.sync_live();
         self.kick();
     }
 

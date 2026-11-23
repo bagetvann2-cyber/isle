@@ -21,11 +21,11 @@
 use crate::model::{Part, PartKind};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::time::{Duration, Instant};
 use windows::Devices::Bluetooth::Advertisement::{
     BluetoothLEAdvertisementBytePattern, BluetoothLEAdvertisementFilter, BluetoothLEAdvertisementReceivedEventArgs,
-    BluetoothLEAdvertisementWatcher, BluetoothLEManufacturerData, BluetoothLEScanningMode,
+    BluetoothLEAdvertisementWatcher, BluetoothLEAdvertisementWatcherStatus, BluetoothLEManufacturerData, BluetoothLEScanningMode,
 };
 use windows::Foundation::TypedEventHandler;
 use windows::Storage::Streams::{Buffer, DataReader, DataWriter, IBuffer};
@@ -322,19 +322,19 @@ fn decode_args(args: &BluetoothLEAdvertisementReceivedEventArgs) -> windows::cor
 
 /// One passive watcher whose Windows-side filter (set by `setup`) keeps only one
 /// vendor's adverts. Filter conditions are ANDed by Windows, so each vendor needs
-/// its own watcher; unfiltered adverts never reach our callback.
+/// its own watcher; unfiltered adverts never reach our callback. `on_found` runs on a
+/// Windows thread-pool thread: it must only hand the advert over (channel send).
 fn start_watcher(
-    tx: &Sender<(u64, Found)>,
+    on_found: impl Fn(u64, Found) + Send + 'static,
     setup: impl FnOnce(&BluetoothLEAdvertisementFilter) -> windows::core::Result<()>,
 ) -> Option<(BluetoothLEAdvertisementWatcher, i64)> {
     let watcher = BluetoothLEAdvertisementWatcher::new().ok()?;
     watcher.SetScanningMode(BluetoothLEScanningMode::Passive).ok()?;
     setup(&watcher.AdvertisementFilter().ok()?).ok()?; // no filter, no watcher (never scan everything)
-    let tx = tx.clone();
     let token = watcher
         .Received(&TypedEventHandler::new(move |_, args: windows::core::Ref<BluetoothLEAdvertisementReceivedEventArgs>| {
-            if let Some(Ok(Some(item))) = args.as_ref().map(decode_args) {
-                let _ = tx.send(item);
+            if let Some(Ok(Some((addr, found)))) = args.as_ref().map(decode_args) {
+                on_found(addr, found);
             }
             Ok(())
         }))
@@ -347,21 +347,86 @@ fn manufacturer_filter(company: u16) -> impl FnOnce(&BluetoothLEAdvertisementFil
     move |f| f.Advertisement()?.ManufacturerData()?.Append(&BluetoothLEManufacturerData::Create(company, &Buffer::Create(0)?)?)
 }
 
+fn start_vendor(vendor: Vendor, on_found: impl Fn(u64, Found) + Send + 'static) -> Option<(BluetoothLEAdvertisementWatcher, i64)> {
+    match vendor {
+        Vendor::Apple => start_watcher(on_found, manufacturer_filter(APPLE)),
+        Vendor::Xiaomi => start_watcher(on_found, manufacturer_filter(XIAOMI_AD)),
+        Vendor::FastPair => start_watcher(on_found, |f| {
+            f.BytePatterns()?.Append(&BluetoothLEAdvertisementBytePattern::Create(SERVICE_DATA_16, 0, &buffer(&FAST_PAIR_UUID)?)?)
+        }),
+    }
+}
+
+/// Which vendor's adverts can belong to these headsets (and nothing else): Xiaomi names
+/// only advertise as Xiaomi, AirPods/Beats as Apple, everything else may speak Fast Pair.
+pub fn vendors_for(headsets: &[Headset]) -> Vec<Vendor> {
+    let mut v = Vec::new();
+    for h in headsets {
+        let k = if is_xiaomi_name(&h.name) {
+            Vendor::Xiaomi
+        } else if is_apple_name(&h.name) {
+            Vendor::Apple
+        } else {
+            Vendor::FastPair
+        };
+        if !v.contains(&k) {
+            v.push(k);
+        }
+    }
+    v
+}
+
+/// Long-running passive watchers for `vendors`, stopped on drop. Start/stop only on a
+/// worker thread, never the UI thread.
+pub struct LiveWatch {
+    vendors: Vec<Vendor>,
+    watchers: Vec<(BluetoothLEAdvertisementWatcher, i64)>,
+}
+
+impl LiveWatch {
+    pub fn vendors(&self) -> &[Vendor] {
+        &self.vendors
+    }
+
+    /// Windows aborts watchers (radio switched off, adapter removed): then restart.
+    pub fn alive(&self) -> bool {
+        self.watchers.iter().all(|(w, _)| w.Status() == Ok(BluetoothLEAdvertisementWatcherStatus::Started))
+    }
+}
+
+impl Drop for LiveWatch {
+    fn drop(&mut self) {
+        for (w, token) in &self.watchers {
+            let _ = w.Stop();
+            let _ = w.RemoveReceived(*token);
+        }
+    }
+}
+
+/// Start continuous watchers; every decoded advert goes to `on_found`. `None` if any failed.
+pub fn start_live(vendors: &[Vendor], on_found: impl Fn(u64, Found) + Clone + Send + 'static) -> Option<LiveWatch> {
+    let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) }; // per thread; S_FALSE / already initialised is fine
+    let mut live = LiveWatch { vendors: vendors.to_vec(), watchers: Vec::new() };
+    for &v in vendors {
+        live.watchers.extend(start_vendor(v, on_found.clone())); // one failing vendor must not silence the rest
+    }
+    (!live.watchers.is_empty()).then_some(live)
+}
+
 /// Blocking passive scan, at most `max`; returns the latest advert per address.
 /// Stops early once a strong advert that fits a connected headset is seen.
 pub fn scan(max: Duration, headsets: &[Headset]) -> Option<Vec<Found>> {
     let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) }; // S_FALSE / already initialised is fine
     let (tx, rx) = channel::<(u64, Found)>();
-    let watchers: Vec<_> = [
-        start_watcher(&tx, manufacturer_filter(APPLE)),
-        start_watcher(&tx, manufacturer_filter(XIAOMI_AD)),
-        start_watcher(&tx, |f| {
-            f.BytePatterns()?.Append(&BluetoothLEAdvertisementBytePattern::Create(SERVICE_DATA_16, 0, &buffer(&FAST_PAIR_UUID)?)?)
-        }),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let watchers: Vec<_> = [Vendor::Apple, Vendor::Xiaomi, Vendor::FastPair]
+        .into_iter()
+        .filter_map(|v| {
+            let tx = tx.clone();
+            start_vendor(v, move |addr, f| {
+                let _ = tx.send((addr, f));
+            })
+        })
+        .collect();
     if watchers.is_empty() {
         return None;
     }
@@ -452,6 +517,12 @@ mod tests {
         let (p, mac) = decode_xiaomi(&hex("16 01 FF 00 4E 7F 64 7F 67 91 A6 34 12 56 EF CD AB E0 34 12 56 EF CD AC")).unwrap();
         assert_eq!(p, [part(PartKind::Right, 100, false)]);
         assert_eq!(mac, None);
+        // case unknown (0x7F, or 0xFF = 0x7F + charging bit): the Case part is omitted
+        for case in ["7F", "FF"] {
+            let (p, _) =
+                decode_xiaomi(&hex(&format!("16 01 FF 00 4E 64 64 {case} 67 91 A6 34 12 56 EF CD AB E0 34 12 56 EF CD AB"))).unwrap();
+            assert_eq!(p, [part(PartKind::Left, 100, false), part(PartKind::Right, 100, false)]);
+        }
         // wrong signature / length
         assert!(decode_xiaomi(&hex("16 02 FF 41 4E E4 E4 55 67 91 A6 34 12 56 EF CD AB E0 34 12 56 EF CD AB")).is_none());
         assert!(decode_xiaomi(&hex("16 01 FF 41 4E E4 E4 55")).is_none());
@@ -467,6 +538,15 @@ mod tests {
         assert_eq!(pick(std::slice::from_ref(&ad), &two), Some(("123456ABCDEF".into(), parts)));
         // a stranger's Xiaomi buds: no match, and never through the RSSI heuristic
         assert!(pick(&[ad], &[hs("111111111111", "Redmi Buds 6", 100)]).is_none());
+    }
+
+    #[test]
+    fn live_watches_only_relevant_vendors() {
+        assert!(vendors_for(&[]).is_empty());
+        assert_eq!(vendors_for(&[hs("A", "Redmi Buds 6", 50)]), [Vendor::Xiaomi]);
+        assert_eq!(vendors_for(&[hs("A", "Redmi Buds 6", 50), hs("B", "POCO Buds", 50)]), [Vendor::Xiaomi]);
+        assert_eq!(vendors_for(&[hs("A", "Anna's AirPods Pro", 50)]), [Vendor::Apple]);
+        assert_eq!(vendors_for(&[hs("A", "Pixel Buds", 50), hs("B", "Redmi Buds 6", 50)]), [Vendor::FastPair, Vendor::Xiaomi]);
     }
 
     fn found(vendor: Vendor, rssi: i16, name: &str, pct: u8) -> Found {
