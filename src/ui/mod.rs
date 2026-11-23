@@ -13,11 +13,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Power::{
+    RegisterPowerSettingNotification, UnregisterPowerSettingNotification, HPOWERNOTIFY, POWERBROADCAST_SETTING,
+};
+use windows::Win32::System::RemoteDesktop::{WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION};
+use windows::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
@@ -73,6 +78,41 @@ static HOOK_HWND: AtomicIsize = AtomicIsize::new(0);
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const DBT_DEVNODES_CHANGED: usize = 0x0007;
 const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
+
+/// Whether anyone can see the screen: display on, session unlocked, console connected.
+/// While not, the island does no periodic work (waveform, BLE watcher, progress timer).
+#[derive(Clone, Copy)]
+struct Screen {
+    display_on: bool,
+    locked: bool,
+    connected: bool,
+}
+
+impl Screen {
+    const fn new() -> Self {
+        Screen { display_on: true, locked: false, connected: true }
+    }
+
+    fn active(self) -> bool {
+        self.display_on && !self.locked && self.connected
+    }
+
+    /// `GUID_CONSOLE_DISPLAY_STATE` payload: 0 off, 1 on, 2 dimmed (still visible).
+    fn set_display(&mut self, state: u32) {
+        self.display_on = state != 0;
+    }
+
+    /// `WM_WTSSESSION_CHANGE` wParam.
+    fn session_event(&mut self, ev: u32) {
+        match ev {
+            WTS_SESSION_LOCK => self.locked = true,
+            WTS_SESSION_UNLOCK => self.locked = false,
+            WTS_CONSOLE_CONNECT | WTS_REMOTE_CONNECT => self.connected = true,
+            WTS_CONSOLE_DISCONNECT | WTS_REMOTE_DISCONNECT => self.connected = false,
+            _ => {}
+        }
+    }
+}
 
 /// Data the worker threads hand to the UI (paired with a `PostMessageW`).
 #[derive(Default)]
@@ -203,6 +243,8 @@ struct App {
     mouse_hook: Option<HHOOK>,
     hinst: HINSTANCE,
     shown: bool,
+    screen: Screen,
+    screen_notify: isize,
     drag: Option<Drag>,
 
     // content
@@ -293,6 +335,8 @@ impl App {
             mouse_hook: None,
             hinst: HINSTANCE::default(),
             shown: false,
+            screen: Screen::new(),
+            screen_notify: 0,
             drag: None,
             media: None,
             prev_title: String::new(),
@@ -478,9 +522,27 @@ impl App {
         self.media.as_ref().is_some_and(|m| m.playing)
     }
 
-    /// The bars are on screen (or about to be): enabled, island shown and not on its way out, media present.
+    /// The island is shown (not on its way out) and the screen is actually lit and unlocked.
+    fn on_screen(&self) -> bool {
+        self.shown && self.vis.target > 0.0 && self.screen.active()
+    }
+
+    /// Display or session state changed: stop or resume the periodic work.
+    fn on_screen_change(&mut self, was_active: bool) {
+        if self.screen.active() == was_active {
+            return;
+        }
+        self.sync_wave();
+        self.sync_live();
+        self.sync_progress_timer();
+        if self.screen.active() {
+            self.kick();
+        }
+    }
+
+    /// The bars are on screen (or about to be): enabled, on screen, media present.
     fn wave_visible(&self) -> bool {
-        self.wave_on && self.shown && self.vis.target > 0.0 && self.media.is_some()
+        self.wave_on && self.on_screen() && self.media.is_some()
     }
 
     fn wave_moving(&self) -> bool {
@@ -817,7 +879,7 @@ impl App {
     /// Earbud L/R/case levels come from a BLE watcher in the battery worker: continuous
     /// while expanded, duty-cycled while merely shown, off while hidden.
     fn sync_live(&self) {
-        let mode = match (self.shown && self.vis.target > 0.0, self.want_exp) {
+        let mode = match (self.on_screen(), self.want_exp) {
             (false, _) => LiveMode::Off,
             (true, false) => LiveMode::Duty,
             (true, true) => LiveMode::Continuous,
@@ -841,7 +903,8 @@ impl App {
     }
 
     fn sync_progress_timer(&mut self) {
-        let want = self.shown && self.want_exp && self.media.as_ref().is_some_and(|m| m.playing && m.duration_ms > 0);
+        let want =
+            self.shown && self.screen.active() && self.want_exp && self.media.as_ref().is_some_and(|m| m.playing && m.duration_ms > 0);
         if want != self.progress_timer {
             self.progress_timer = want;
             // SAFETY: timer on our own window.
@@ -1627,10 +1690,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if let Some(b) = &app().battery {
                     b.refresh();
                 }
+            } else if wp.0 == PBT_POWERSETTINGCHANGE as usize && lp.0 != 0 {
+                // SAFETY: for this event lParam points to a POWERBROADCAST_SETTING for the call's duration.
+                let p = lp.0 as *const POWERBROADCAST_SETTING;
+                if (*p).PowerSetting == GUID_CONSOLE_DISPLAY_STATE && (*p).DataLength as usize >= 4 {
+                    let a = app();
+                    let was = a.screen.active();
+                    a.screen.set_display(std::ptr::addr_of!((*p).Data).cast::<u32>().read_unaligned());
+                    a.on_screen_change(was);
+                }
             }
             LRESULT(1)
         }
+        WM_WTSSESSION_CHANGE => {
+            let a = app();
+            let was = a.screen.active();
+            a.screen.session_event(wp.0 as u32);
+            a.on_screen_change(was);
+            LRESULT(0)
+        }
         WM_DESTROY => {
+            let _ = WTSUnRegisterSessionNotification(hwnd);
+            let n = std::mem::take(&mut app().screen_notify);
+            if n != 0 {
+                let _ = UnregisterPowerSettingNotification(HPOWERNOTIFY(n));
+            }
             app().tray_remove();
             PostQuitMessage(0);
             LRESULT(0)
@@ -1722,6 +1806,10 @@ pub fn run() -> windows::core::Result<()> {
         a.fs_hidden = fullscreen_active(hwnd);
         a.hinst = hinst.into();
         HOOK_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+        let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+        if let Ok(n) = RegisterPowerSettingNotification(HANDLE(hwnd.0), &GUID_CONSOLE_DISPLAY_STATE, DEVICE_NOTIFY_WINDOW_HANDLE) {
+            a.screen_notify = n.0;
+        }
         a.update_zone();
         a.sync_hook(false);
         WM_TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
@@ -1742,5 +1830,38 @@ pub fn run() -> windows::core::Result<()> {
             let _ = UnhookWindowsHookEx(h);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screen_state() {
+        let mut s = Screen::new();
+        assert!(s.active());
+        s.set_display(2);
+        assert!(s.active(), "dimmed is still visible");
+        s.set_display(0);
+        assert!(!s.active());
+        s.set_display(1);
+        assert!(s.active());
+        s.session_event(WTS_SESSION_LOCK);
+        assert!(!s.active());
+        s.set_display(0);
+        s.session_event(WTS_SESSION_UNLOCK);
+        assert!(!s.active(), "display still off");
+        s.set_display(1);
+        assert!(s.active());
+        s.session_event(WTS_CONSOLE_DISCONNECT);
+        assert!(!s.active());
+        s.session_event(WTS_CONSOLE_CONNECT);
+        assert!(s.active());
+        s.session_event(WTS_REMOTE_DISCONNECT);
+        assert!(!s.active());
+        s.session_event(WTS_REMOTE_CONNECT);
+        s.session_event(99);
+        assert!(s.active());
     }
 }

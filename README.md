@@ -38,6 +38,7 @@ Measured on Windows 11 at 125% scaling:
 
 - idle CPU: about 0% (0 ms over 20 s, visible or hidden, nothing playing or paused)
 - waveform, island visible and music playing: about 1% of one core (a bars-only frame costs about 0.2 ms, drawn at about 30 fps, plus a level read about 10 times a second); a silent track that is "playing": about 0.3% (the level is polled every 150 ms); island hidden while music plays: about 0% (under one 16 ms scheduler tick over 20 s); paused: 0 ms
+- waveform, live-battery scanning and the progress timer pause while the display is off or the PC is locked
 - private memory: about 11-12 MB
 - `isle.exe`: about 0.65 MB
 - animation frame: about 1.5-2 ms (render + present); no frames and no timers when nothing moves
