@@ -22,7 +22,7 @@ use windows::Win32::System::Power::{
     RegisterPowerSettingNotification, UnregisterPowerSettingNotification, HPOWERNOTIFY, POWERBROADCAST_SETTING,
 };
 use windows::Win32::System::RemoteDesktop::{WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION};
-use windows::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
+use windows::Win32::System::SystemServices::GUID_SESSION_DISPLAY_STATUS;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
@@ -97,7 +97,7 @@ impl Screen {
         self.display_on && !self.locked && self.connected
     }
 
-    /// `GUID_CONSOLE_DISPLAY_STATE` payload: 0 off, 1 on, 2 dimmed (still visible).
+    /// `GUID_SESSION_DISPLAY_STATUS` payload: 0 off, 1 on, 2 dimmed (still visible).
     fn set_display(&mut self, state: u32) {
         self.display_on = state != 0;
     }
@@ -1693,7 +1693,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             } else if wp.0 == PBT_POWERSETTINGCHANGE as usize && lp.0 != 0 {
                 // SAFETY: for this event lParam points to a POWERBROADCAST_SETTING for the call's duration.
                 let p = lp.0 as *const POWERBROADCAST_SETTING;
-                if (*p).PowerSetting == GUID_CONSOLE_DISPLAY_STATE && (*p).DataLength as usize >= 4 {
+                if (*p).PowerSetting == GUID_SESSION_DISPLAY_STATUS && (*p).DataLength as usize >= 4 {
                     let a = app();
                     let was = a.screen.active();
                     a.screen.set_display(std::ptr::addr_of!((*p).Data).cast::<u32>().read_unaligned());
@@ -1807,7 +1807,7 @@ pub fn run() -> windows::core::Result<()> {
         a.hinst = hinst.into();
         HOOK_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
         let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
-        if let Ok(n) = RegisterPowerSettingNotification(HANDLE(hwnd.0), &GUID_CONSOLE_DISPLAY_STATE, DEVICE_NOTIFY_WINDOW_HANDLE) {
+        if let Ok(n) = RegisterPowerSettingNotification(HANDLE(hwnd.0), &GUID_SESSION_DISPLAY_STATUS, DEVICE_NOTIFY_WINDOW_HANDLE) {
             a.screen_notify = n.0;
         }
         a.update_zone();
