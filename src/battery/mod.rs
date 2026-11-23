@@ -4,6 +4,7 @@
 
 mod ble;
 mod bluetooth;
+mod gamepad;
 mod live;
 mod logitech;
 
@@ -125,7 +126,7 @@ pub fn spawn(on_update: Box<dyn Fn(Vec<Device>) + Send>) -> BatteryHandle {
     let tx_worker = tx.clone();
     let started = std::thread::Builder::new().name("battery".into()).spawn(move || {
         let mut logitech = logitech::Poller::default();
-        let (mut bt, mut lg) = (Vec::new(), Vec::new());
+        let (mut bt, mut lg, mut gp) = (Vec::new(), Vec::new(), Vec::new());
         let mut last: Option<Vec<Device>> = None;
         let mut attached: Option<ble::Attached> = None;
         let now = Instant::now();
@@ -147,6 +148,7 @@ pub fn spawn(on_update: Box<dyn Fn(Vec<Device>) + Send>) -> BatteryHandle {
                 // a headset that was not connected before: look for its per-bud advert
                 let new_headset = polled.iter().any(|d| is_headset(d) && !bt.iter().any(|o: &Device| o.id == d.id));
                 bt = polled;
+                gp = gamepad::poll();
                 // (a live watcher already listens; otherwise take one short one-shot look)
                 if new_headset && !live.wants_scan(now) {
                     start_scan(&bt, &tx_worker);
@@ -166,7 +168,7 @@ pub fn spawn(on_update: Box<dyn Fn(Vec<Device>) + Send>) -> BatteryHandle {
             }
             if do_bt || do_lg || publish {
                 publish = false;
-                let mut list = merge(vec![bt.clone(), lg.clone()]);
+                let mut list = merge(vec![gamepad::supersede(&bt, &gp), lg.clone(), gp.clone()]);
                 ble::apply(&mut list, &attached);
                 if last.as_ref() != Some(&list) {
                     last = Some(list.clone());
@@ -223,7 +225,8 @@ pub fn spawn(on_update: Box<dyn Fn(Vec<Device>) + Send>) -> BatteryHandle {
 
 /// Synchronous one-shot poll of every source, for `--dump-batteries`.
 pub fn snapshot_now() -> Vec<Device> {
-    merge(vec![bluetooth::poll(), logitech::poll()])
+    let (bt, gp) = (bluetooth::poll(), gamepad::poll());
+    merge(vec![gamepad::supersede(&bt, &gp), logitech::poll(), gp])
 }
 
 /// Dedupe by `id` (first source wins) and sort per the public contract.

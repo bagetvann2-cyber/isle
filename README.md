@@ -9,7 +9,7 @@ A tiny Dynamic-Island-style pill for Windows: what's playing, and the battery of
 
 - **Media**: cover, title, artist, progress and play / pause / prev / next for any app that shows up in the Windows media controls (Spotify, Yandex Music, browsers, Media Player...).
 - **Waveform**: six bars next to the play control that move with the sound actually coming out of your speakers, tinted with the cover's colour (grey when there is no cover). Switch it off in the menu.
-- **Batteries**: wireless headphones, earbuds (left / right / case), mice, keyboards. Percent turns green with a bolt while charging, red at 15% or less.
+- **Batteries**: wireless headphones, earbuds (left / right / case), mice, keyboards, Xbox controllers. Percent turns green with a bolt while charging, red at 15% or less.
 - **Hover** to expand, **drag** to move it, **right-click** (or the tray icon) for the menu.
 - **Auto-hide**: invisible and click-through until the cursor comes near it. Hides while a fullscreen app is in front.
 - Spring animations, paced to your display refresh and only while something moves.
@@ -24,11 +24,13 @@ A tiny Dynamic-Island-style pill for Windows: what's playing, and the battery of
 | Earbud L / R / case: Google Fast Pair | left, right, case, charging | decoded from the spec, checked against third-party adverts |
 | Earbud L / R / case: AirPods | left, right, case, charging | community-documented layout, **unverified** |
 | Logitech HID++ 2.0 (Unifying / Bolt / Lightspeed receivers, direct) | percent and charging | experimental, read-only queries, untested on hardware |
+| Xbox controllers (Xbox Wireless adapter / Bluetooth / USB) | percent and charging via Windows.Gaming.Input; the XInput fallback only has 4 levels | **untested on hardware** (no Xbox controller available) |
 | Razer, SteelSeries, HyperX, Corsair dongles | - | not supported |
+| Third-party 2.4 GHz dongles that emulate a wired Xbox 360 pad (e.g. 8BitDo Ultimate 2C) | - | not supported: they report no battery to Windows |
 
 No real mouse has been tested yet: Bluetooth mice should work through the Windows battery property; Logitech is untested.
 
-Earbud parts come from a short passive Bluetooth scan that runs when the island expands (at most every 30 s) and when a headset connects, including at app start. Charging is only shown where the source reports it (Logitech, BLE earbuds).
+Earbud parts come from a short passive Bluetooth scan that runs when the island expands (at most every 30 s) and when a headset connects, including at app start. Charging is only shown where the source reports it (Logitech, Xbox controllers, BLE earbuds).
 
 ## Resource use
 
@@ -68,7 +70,7 @@ A source is one module in `src/battery/` with `fn poll() -> Vec<Device>` (see `b
 
 ## Privacy
 
-No network access. It reads device batteries, the Windows media session and the output peak level of your default playback device (a single number from the Windows audio meter, used for the waveform; it never records or reads audio), nothing else, and writes nothing to your devices (the Logitech source sends read-only queries). Position, the always-visible flag and the waveform flag live in `HKCU\Software\isle`; autostart is the `isle` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+No network access. It reads device batteries, the Windows media session and the output peak level of your default playback device (a single number from the Windows audio meter, used for the waveform; it never records or reads audio), nothing else, and writes nothing to your devices (the Logitech source sends read-only queries; the gamepad source only reads the Windows battery report). Position, the always-visible flag and the waveform flag live in `HKCU\Software\isle`; autostart is the `isle` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 
 To know when the cursor approaches the island, isle installs a global low-level mouse hook (`WH_MOUSE_LL`). It only compares the cursor position with a small rectangle and posts a message when the cursor enters or leaves it; it reads nothing else and logs nothing. The hook is removed while a fullscreen app is in front and when "Always visible" is on.
 

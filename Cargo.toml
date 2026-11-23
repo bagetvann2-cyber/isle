@@ -8,6 +8,10 @@ license = "MIT"
 [dependencies]
 windows = { version = "0.62", features = [
     "Foundation",
+    "Gaming_Input",
+    "Devices_Power",
+    "System_Power",
+    "Win32_UI_Input_XboxController",
     "Devices_Bluetooth",
     "Devices_Bluetooth_Advertisement",
     "Win32_System_WinRT",

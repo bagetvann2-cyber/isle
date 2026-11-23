@@ -1057,6 +1057,17 @@ impl App {
                 },
             ];
         }
+        if test_knob("ISLE_FAKE_GAMEPAD") {
+            // debug-only: a charging gamepad
+            new.push(Device {
+                id: "fake-pad".into(),
+                name: "Xbox Wireless Controller".into(),
+                kind: crate::model::DeviceKind::Gamepad,
+                percent: 64,
+                charging: Some(true),
+                parts: Vec::new(),
+            });
+        }
         if test_knob("ISLE_FAKE_BUDS") {
             // debug-only: earbuds with parts, left bud charging
             new.push(Device {
