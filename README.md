@@ -55,7 +55,8 @@ Download `isle.exe` from the Releases page and run it. It is unsigned, so Window
 - Click the cover for next track, the play / pause glyph to toggle.
 - In the expanded pill, the circular-arrow **10** buttons jump 10 seconds back / forward, and clicking the progress bar seeks to that point. Seeking works only in players that allow it in the Windows media controls; otherwise the buttons are dimmed.
 - Drag to reposition (saved); "Reset position" in the menu puts it back.
-- Right-click the pill or the tray icon: **Start with Windows**, **Always visible** (turns auto-hide off), **Show waveform**, **Reset position**, **Exit**. Left-clicking the tray icon shows the island for a few seconds.
+- Right-click the pill or the tray icon: **Start with Windows**, **Always visible** (turns auto-hide off), **Show waveform**, **Size**, **Reset position**, **Exit**. Left-clicking the tray icon shows the island for a few seconds.
+- Size: the **Size** submenu offers 75 / 85 / 100 / 115 / 130 %, or hold **Ctrl** and scroll over the pill (5 % per notch, 60-150 %). It applies live and is saved. The default is 85 %.
 
 ## Build from source
 
@@ -74,7 +75,7 @@ A source is one module in `src/battery/` with `fn poll() -> Vec<Device>` (see `b
 
 ## Privacy
 
-No network access. It reads device batteries, the Windows media session and the output peak level of your default playback device (a single number from the Windows audio meter, used for the waveform; it never records or reads audio), nothing else, and writes nothing to your devices (the Logitech source sends read-only queries; the gamepad source only reads the Windows battery report). Position, the always-visible flag and the waveform flag live in `HKCU\Software\isle`; autostart is the `isle` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+No network access. It reads device batteries, the Windows media session and the output peak level of your default playback device (a single number from the Windows audio meter, used for the waveform; it never records or reads audio), nothing else, and writes nothing to your devices (the Logitech source sends read-only queries; the gamepad source only reads the Windows battery report). Position, size, the always-visible flag and the waveform flag live in `HKCU\Software\isle`; autostart is the `isle` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 
 To know when the cursor approaches the island, isle installs a global low-level mouse hook (`WH_MOUSE_LL`). It only compares the cursor position with a small rectangle and posts a message when the cursor enters or leaves it; it reads nothing else and logs nothing. The hook is removed while a fullscreen app is in front and when "Always visible" is on.
 

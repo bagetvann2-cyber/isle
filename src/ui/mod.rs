@@ -67,19 +67,26 @@ const T_PROGRESS: usize = 2;
 const T_LEAVE: usize = 3;
 const T_DEVCHANGE: usize = 4;
 const T_HIDE: usize = 5;
+/// One-shot: saves the Ctrl+wheel size once the wheel has been quiet for `SIZE_SAVE_MS`.
+const T_SIZE: usize = 6;
+const SIZE_SAVE_MS: u32 = 500;
 
-/// User-requested size: everything is drawn at 75% of the reference design.
-const UI_SCALE: f32 = 0.75;
+/// Physical px per logical px: monitor DPI times the user's size setting.
+fn scale_for(dpi: u32, size_pct: u32) -> f32 {
+    dpi as f32 / 96.0 * size_pct as f32 / 100.0
+}
 /// Minimum distance (logical px) between the pill and every work-area edge.
 const EDGE_GAP: f32 = 12.0;
-/// Reveal zone padding around the compact pill, physical px at 100% DPI.
-const ZONE_PAD: f32 = 24.0;
+/// Reveal zone padding around the compact pill, logical px.
+const ZONE_PAD: f32 = 28.0;
 /// Zone rect (l, t, r, b, physical px) shared with the low-level mouse hook proc.
 static ZONE: [AtomicI32; 4] = [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)];
 static INSIDE: AtomicBool = AtomicBool::new(false);
 static HOOK_HWND: AtomicIsize = AtomicIsize::new(0);
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
+/// WM_MOUSEWHEEL wParam flag: Ctrl is down.
+const MK_CONTROL: usize = 0x0008;
 const DBT_DEVNODES_CHANGED: usize = 0x0007;
 const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
 
@@ -197,6 +204,10 @@ struct App {
     ru: bool,
 
     // geometry (physical px)
+    dpi: u32,
+    size_pct: u32,
+    /// Unspent Ctrl+wheel delta (fractions of a notch).
+    wheel_acc: i32,
     scale: f32,
     gm: i32,
     win_w: i32,
@@ -300,7 +311,10 @@ impl App {
             battery: None,
             r: None,
             ru,
-            scale: dpi as f32 / 96.0 * UI_SCALE,
+            dpi,
+            size_pct: settings::size_pct(),
+            wheel_acc: 0,
+            scale: 0.0,
             gm: 0,
             win_w: 0,
             win_h: 0,
@@ -359,6 +373,7 @@ impl App {
             prev_cover: None,
             devs: Vec::new(),
         };
+        a.scale = scale_for(dpi, a.size_pct);
         a.recompute_size();
         match saved {
             Some((x, y)) => {
@@ -418,7 +433,7 @@ impl App {
     /// Reveal zone for the hook proc: the compact pill (or the expanded one) inflated by 24 px.
     fn update_zone(&self) {
         let s = self.scale;
-        let pad = (ZONE_PAD * s / UI_SCALE).round() as i32;
+        let pad = (ZONE_PAD * s).round() as i32;
         let left = self.pill_left();
         let w = (self.width.target * s).round() as i32;
         let h = (PILL_H * s).round() as i32;
@@ -752,7 +767,7 @@ impl App {
             Edge::Left => pill.l - line,
             Edge::Right => line - pill.r,
         };
-        let b = RestBox { w: pill.w(), h: pill.b - pill.t, hc: PILL_H, g, r: radius, rs_max: liquid::SHOULDER / UI_SCALE };
+        let b = RestBox { w: pill.w(), h: pill.b - pill.t, hc: PILL_H, g, r: radius, rs_max: liquid::SHOULDER };
         Some(Liquid { edge, line, centre: ((pill.l + pill.r) / 2.0, (pill.t + pill.b) / 2.0), sh: shape(edge, &b, self.vis.x, self.q.x) })
     }
 
@@ -1333,14 +1348,38 @@ bar {} {} {}
     // ---- system events ----
 
     fn on_dpi(&mut self, dpi: u32) {
+        self.dpi = dpi;
+        self.rescale(false);
+    }
+
+    /// Recompute everything that derives from `scale`. `anchor`: a size change keeps the gap to the
+    /// nearest work-area edge and the centre along it; a DPI change keeps the left edge / centre.
+    fn rescale(&mut self, anchor: bool) {
+        let old = self.scale;
         let left = self.pill_left();
         let center = self.win_x + self.win_w / 2;
-        self.scale = dpi as f32 / 96.0 * UI_SCALE;
+        let tw = self.width.target;
+        let wpx = |s: f32| (tw * s).round() as i32;
+        let hpx = |s: f32| (PILL_H * s).round() as i32;
+        self.scale = scale_for(self.dpi, self.size_pct);
+        let s = self.scale;
         self.recompute_size();
-        if self.frac == 0.0 {
+        if anchor {
+            let pill = IRect { l: left, t: self.top_y, r: left + wpx(old), b: self.top_y + hpx(old) };
+            let (work, _) = work_area(left + wpx(old) / 2, self.top_y, false);
+            let work = IRect { l: work.left, t: work.top, r: work.right, b: work.bottom };
+            let (nl, nt) = anchor_pos(work, pill, s / old, wpx(s), hpx(s));
+            self.top_y = nt;
+            self.win_x = nl - self.gm - ((MAX_W - tw) * self.frac * s).round() as i32;
+        } else if self.frac == 0.0 {
             self.win_x = left - self.gm;
         } else {
             self.win_x = center - self.win_w / 2;
+        }
+        if self.open.x > 0.0 {
+            // Expanded now: the room below / above changed with the scale.
+            let (w, _) = work_area(self.pill_left(), self.top_y, false);
+            self.up = !expand_down(self.top_y, s, PART_ROW_H * MAX_PART_ROWS as f32, w.top, w.bottom);
         }
         self.clamp_to_monitor();
         if let Some(r) = &mut self.r {
@@ -1348,6 +1387,48 @@ bar {} {} {}
         }
         self.tray_sync(false);
         self.paint();
+    }
+
+    /// Apply a new size live: finish any show / expand motion first so nothing animates across the resize.
+    fn set_size(&mut self, pct: u32) {
+        let pct = clamp_pct(pct as i32);
+        if pct == self.size_pct {
+            return;
+        }
+        self.size_pct = pct;
+        for sp in [&mut self.open, &mut self.width, &mut self.vis, &mut self.q, &mut self.press] {
+            sp.snap();
+        }
+        self.rescale(true);
+        self.kick();
+    }
+
+    /// Ctrl + wheel over the pill: +-`WHEEL_STEP_PCT` per notch, saved after the wheel goes quiet.
+    fn on_wheel(&mut self, delta: i32) {
+        if self.drag.is_some() {
+            return;
+        }
+        let (acc, steps) = wheel_steps(self.wheel_acc, delta);
+        self.wheel_acc = acc;
+        if steps != 0 {
+            self.set_size(clamp_pct(self.size_pct as i32 + steps * WHEEL_STEP_PCT));
+            // SAFETY: (re)arms a one-shot timer on our own window.
+            unsafe {
+                SetTimer(Some(self.hwnd), T_SIZE, SIZE_SAVE_MS, None);
+            }
+        }
+    }
+
+    /// Store the size (and, if the user placed the island, its position, which moved with the size).
+    fn save_size(&mut self) {
+        // SAFETY: timer on our own window.
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), T_SIZE);
+        }
+        settings::set_size_pct(self.size_pct);
+        if test_pos().is_none() && settings::load_pos().is_some() {
+            settings::save_pos(self.pill_left(), self.top_y);
+        }
     }
 
     fn on_foreground(&mut self) {
@@ -1424,7 +1505,7 @@ bar {} {} {}
             (ir(mi.rcWork), ir(mi.rcMonitor))
         };
         let hc = (PILL_H * s).round() as i32;
-        let min_gap = (liquid::MIN_GAP * s / UI_SCALE).round() as i32;
+        let min_gap = (liquid::MIN_GAP * s).round() as i32;
         // SAFETY: point query only.
         let other = |x, y| unsafe { !MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONULL).is_invalid() };
         let e = choose_edge(rest, work, mon, hc, min_gap, other)?;
@@ -1678,12 +1759,15 @@ unsafe extern "system" fn mouse_ll(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
     CallNextHookEx(None, code, wp, lp)
 }
 
+/// Menu command id of a size preset: `SIZE_CMD + percent`.
+const SIZE_CMD: usize = 100;
+
 unsafe fn show_menu(hwnd: HWND) {
     let ru = app().ru;
-    let (t_auto, t_reset, t_exit, t_vis, t_wave) = if ru {
-        ("Запускать вместе с Windows", "Сбросить позицию", "Выход", "Всегда показывать", "Показывать волну")
+    let (t_auto, t_reset, t_exit, t_vis, t_wave, t_size) = if ru {
+        ("Запускать вместе с Windows", "Сбросить позицию", "Выход", "Всегда показывать", "Показывать волну", "Размер")
     } else {
-        ("Start with Windows", "Reset position", "Exit", "Always visible", "Show waveform")
+        ("Start with Windows", "Reset position", "Exit", "Always visible", "Show waveform", "Size")
     };
     let Ok(menu) = CreatePopupMenu() else { return };
     let (a, b, c, d, e) = (wide0(t_auto), wide0(t_reset), wide0(t_exit), wide0(t_vis), wide0(t_wave));
@@ -1693,6 +1777,17 @@ unsafe fn show_menu(hwnd: HWND) {
     let _ = AppendMenuW(menu, vflags, 4, PCWSTR(d.as_ptr()));
     let wflags = if app().wave_on { MF_STRING | MF_CHECKED } else { MF_STRING };
     let _ = AppendMenuW(menu, wflags, 5, PCWSTR(e.as_ptr()));
+    let labels: Vec<Vec<u16>> = SIZE_PRESETS.iter().map(|p| wide0(&format!("{p} %"))).collect();
+    let t_size = wide0(t_size);
+    if let Ok(sub) = CreatePopupMenu() {
+        for (p, l) in SIZE_PRESETS.iter().zip(&labels) {
+            let _ = AppendMenuW(sub, MF_STRING, SIZE_CMD + *p as usize, PCWSTR(l.as_ptr()));
+        }
+        if let Some(i) = SIZE_PRESETS.iter().position(|&p| p == app().size_pct) {
+            let _ = CheckMenuRadioItem(sub, 0, SIZE_PRESETS.len() as u32 - 1, i as u32, MF_BYPOSITION.0);
+        }
+        let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(t_size.as_ptr()));
+    }
     let _ = AppendMenuW(menu, MF_STRING, 2, PCWSTR(b.as_ptr()));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, 3, PCWSTR(c.as_ptr()));
@@ -1729,6 +1824,10 @@ unsafe fn show_menu(hwnd: HWND) {
         3 => {
             let _ = DestroyWindow(hwnd);
             return;
+        }
+        c if (SIZE_CMD + SIZE_MIN as usize..=SIZE_CMD + SIZE_MAX as usize).contains(&(c as usize)) => {
+            a.set_size(c as u32 - SIZE_CMD as u32);
+            a.save_size();
         }
         _ => {}
     }
@@ -1784,9 +1883,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             show_menu(hwnd);
             LRESULT(0)
         }
+        WM_MOUSEWHEEL => {
+            if wp.0 & MK_CONTROL != 0 {
+                app().on_wheel((wp.0 >> 16) as u16 as i16 as i32);
+            }
+            LRESULT(0)
+        }
         WM_TIMER => {
             let a = app();
             match wp.0 {
+                T_SIZE => a.save_size(),
                 T_PROGRESS => a.paint(),
                 T_LEAVE => {
                     let _ = KillTimer(Some(hwnd), T_LEAVE);
@@ -1938,7 +2044,7 @@ pub fn run() -> windows::core::Result<()> {
         let dpi = GetDpiForWindow(hwnd);
         let r = Renderer::new(a0.win_w, a0.win_h);
         a0.r = r.ok();
-        if dpi != 0 && (dpi as f32 / 96.0 * UI_SCALE - a0.scale).abs() > 0.01 {
+        if dpi != 0 && (scale_for(dpi, a0.size_pct) - a0.scale).abs() > 0.01 {
             a0.on_dpi(dpi);
         }
         let hw = hwnd.0 as isize;

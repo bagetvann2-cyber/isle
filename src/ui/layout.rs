@@ -1,5 +1,7 @@
 //! Pure geometry in logical pixels (100% scale). No Win32 here, so it is unit-testable.
 
+use super::liquid::IRect;
+
 pub const PILL_H: f32 = 84.0;
 pub const EXP_H: f32 = 168.0;
 pub const GLOW: f32 = 14.0;
@@ -151,9 +153,80 @@ pub fn fmt_time(ms: u64) -> String {
     }
 }
 
+/// UI size, percent of the reference design (the effective scale is `pct / 100`).
+pub const SIZE_DEFAULT: u32 = 85;
+pub const SIZE_MIN: u32 = 60;
+pub const SIZE_MAX: u32 = 150;
+pub const SIZE_PRESETS: [u32; 5] = [75, 85, 100, 115, 130];
+/// Ctrl + wheel step per notch.
+pub const WHEEL_STEP_PCT: i32 = 5;
+const WHEEL_DELTA: i32 = 120;
+
+pub fn clamp_pct(p: i32) -> u32 {
+    p.clamp(SIZE_MIN as i32, SIZE_MAX as i32) as u32
+}
+
+/// Adds a wheel delta to the carried remainder (reversing direction drops it): returns
+/// `(remainder, whole notches)`, so precision touchpads accumulate until a notch is full.
+pub fn wheel_steps(acc: i32, delta: i32) -> (i32, i32) {
+    let acc = if acc != 0 && (acc > 0) != (delta > 0) { 0 } else { acc };
+    let t = acc + delta;
+    (t % WHEEL_DELTA, t / WHEEL_DELTA)
+}
+
+/// New pill left / top after a rescale by `k`: keeps the gap (scaled) to the nearest work-area edge
+/// and the pill's centre along that edge. `pill` is the old rect, `new_w` / `new_h` the new pill size.
+pub fn anchor_pos(work: IRect, pill: IRect, k: f32, new_w: i32, new_h: i32) -> (i32, i32) {
+    let gap = |g: i32| (g as f32 * k).round() as i32;
+    let (cx, cy) = ((pill.l + pill.r) / 2, (pill.t + pill.b) / 2);
+    let gaps = [pill.t - work.t, work.b - pill.b, pill.l - work.l, work.r - pill.r];
+    let near = (0..4).min_by_key(|&i| gaps[i]).unwrap_or(0);
+    let (x, y) = (cx - new_w / 2, cy - new_h / 2);
+    match near {
+        0 => (x, work.t + gap(gaps[0])),
+        1 => (x, work.b - gap(gaps[1]) - new_h),
+        2 => (work.l + gap(gaps[2]), y),
+        _ => (work.r - gap(gaps[3]) - new_w, y),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel() {
+        assert_eq!(wheel_steps(0, 120), (0, 1));
+        assert_eq!(wheel_steps(0, -240), (0, -2));
+        assert_eq!(wheel_steps(0, 30), (30, 0)); // touchpad: partial deltas accumulate
+        assert_eq!(wheel_steps(90, 30), (0, 1));
+        assert_eq!(wheel_steps(90, -30), (-30, 0)); // direction change drops the remainder
+        assert_eq!(wheel_steps(-60, -90), (-30, -1));
+    }
+
+    #[test]
+    fn pct_clamp() {
+        assert_eq!(clamp_pct(10), SIZE_MIN);
+        assert_eq!(clamp_pct(999), SIZE_MAX);
+        assert_eq!(clamp_pct(85), 85);
+        assert!(SIZE_PRESETS.contains(&SIZE_DEFAULT));
+    }
+
+    #[test]
+    fn anchor() {
+        let work = IRect { l: 0, t: 0, r: 1920, b: 1040 };
+        let r = |l, t, w, h| IRect { l, t, r: l + w, b: t + h };
+        // top-docked, centred: stays at the top centre, gap scales
+        assert_eq!(anchor_pos(work, r(768, 10, 384, 64), 1.5, 576, 96), (672, 15));
+        // bottom-docked: bottom gap kept
+        assert_eq!(anchor_pos(work, r(768, 966, 384, 64), 2.0, 768, 128), (576, 1040 - 20 - 128));
+        // left-docked: centre y kept
+        assert_eq!(anchor_pos(work, r(10, 500, 384, 64), 0.5, 192, 32), (5, 516));
+        // right-docked
+        assert_eq!(anchor_pos(work, r(1526, 500, 384, 64), 1.0, 384, 64), (1526, 500));
+        // nearest wins: top gap 10 < left gap 40
+        assert_eq!(anchor_pos(work, r(40, 10, 384, 64), 1.0, 384, 64), (40, 10));
+    }
 
     #[test]
     fn widths() {

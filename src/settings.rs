@@ -1,5 +1,6 @@
 //! Registry-backed settings: window position, autostart and display flags.
 
+use crate::ui::layout::{SIZE_DEFAULT, SIZE_MAX, SIZE_MIN};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Registry::*;
@@ -93,4 +94,13 @@ pub fn waveform() -> bool {
 
 pub fn set_waveform(on: bool) {
     set_u32(w!("waveform"), on as u32);
+}
+
+/// UI size in percent of the reference design; unset means `layout::SIZE_DEFAULT`.
+pub fn size_pct() -> u32 {
+    get_u32(w!("size_pct")).map_or(SIZE_DEFAULT, |v| v.clamp(SIZE_MIN, SIZE_MAX))
+}
+
+pub fn set_size_pct(p: u32) {
+    set_u32(w!("size_pct"), p);
 }

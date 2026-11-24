@@ -6,10 +6,10 @@
 
 use super::layout::Rect;
 
-/// Smallest gap (physical px at 100% DPI) between the pill and an edge for it to be a candidate.
-pub const MIN_GAP: f32 = 4.0;
-/// Radius of the meniscus where the neck meets the edge, physical px at 100% DPI.
-pub const SHOULDER: f32 = 8.0;
+/// Smallest gap (logical px) between the pill and an edge for it to be a candidate.
+pub const MIN_GAP: f32 = 5.0;
+/// Radius of the meniscus where the neck meets the edge, logical px.
+pub const SHOULDER: f32 = 10.5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Edge {
