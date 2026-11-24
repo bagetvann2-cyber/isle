@@ -50,9 +50,12 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_Networking_WinHttp",
+    "Win32_Security_Cryptography",
 ] }
 windows-numerics = "0.3"
 hidapi = { version = "2", default-features = false, features = ["windows-native"] }
+serde_json = "1.0.154"
 
 [profile.release]
 opt-level = 3
