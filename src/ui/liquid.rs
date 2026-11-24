@@ -143,7 +143,8 @@ pub fn shape(edge: Edge, b: &RestBox, p: f32, q: f32) -> Shape {
         }
     } else {
         // Thins quickly (squared) as the body lets go, like a neck about to snap.
-        let t = (1.0 - near / (0.8 * b.g.max(0.01))).clamp(0.0, 1.0);
+        // No gap to neck across (g < 1 px): no neck at all.
+        let t = if b.g < 1.0 { 0.0 } else { (1.0 - near / (0.8 * b.g)).clamp(0.0, 1.0) };
         (along - 2.0 * r) * t * t
     };
     // The body sits where the rest rect would, shifted along n and squashed about its centre.
@@ -156,7 +157,7 @@ pub fn shape(edge: Edge, b: &RestBox, p: f32, q: f32) -> Shape {
         c,
         // The meniscus belongs to a detached neck: while the body still crosses the edge line it would
         // only add horns at the corners, so it grows in over the first pixels after detaching.
-        rs: if near > 0.0 { b.rs_max.min(near + depth) * (near / (0.25 * b.g.max(0.01))).clamp(0.0, 1.0) } else { 0.0 },
+        rs: if near > 0.0 { b.rs_max.min(near + depth) * (near / (0.25 * b.g.max(1.0))).clamp(0.0, 1.0) } else { 0.0 },
         glow: smoothstep(0.8, 1.0, p),
         sigma,
         shift: if edge.vertical() { 0.0 } else { shift },
@@ -355,6 +356,27 @@ mod tests {
         let mon = IRect { b: 150, ..MON };
         assert_eq!(pick(pill(565, 20), tall, mon, alone), Some(Edge::Top));
         assert_eq!(pick(pill(565, 60), tall, mon, alone), Some(Edge::Bottom));
+    }
+
+    #[test]
+    fn clamped_gap_picks_top() {
+        // The clamp keeps the gap >= 12, which qualifies; a flush (0) pill never does.
+        assert_eq!(pick(pill(565, 12), WORK, MON, |_, _| false), Some(Edge::Top));
+        assert_eq!(pick(pill(565, 0), WORK, MON, |_, _| false), None);
+    }
+
+    #[test]
+    fn zero_gap_is_finite() {
+        let b = RestBox { g: 0.0, ..B };
+        for e in EDGES {
+            for i in 0..=108 {
+                let p = i as f32 * 0.01;
+                let s = shape(e, &b, p, (p - 0.08).max(0.0));
+                for v in [s.near, s.depth, s.along, s.r, s.c, s.rs, s.glow, s.sigma, s.shift, s.content] {
+                    assert!(v.is_finite(), "{e:?} {p}: {s:?}");
+                }
+            }
+        }
     }
 
     #[test]

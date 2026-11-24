@@ -70,6 +70,8 @@ const T_HIDE: usize = 5;
 
 /// User-requested size: everything is drawn at 75% of the reference design.
 const UI_SCALE: f32 = 0.75;
+/// Minimum distance (logical px) between the pill and every work-area edge.
+const EDGE_GAP: f32 = 12.0;
 /// Reveal zone padding around the compact pill, physical px at 100% DPI.
 const ZONE_PAD: f32 = 24.0;
 /// Zone rect (l, t, r, b, physical px) shared with the low-level mouse hook proc.
@@ -367,6 +369,10 @@ impl App {
             None => a.place_default(&work),
         }
         a.clamp_to_monitor();
+        // A saved spot that had to be pushed inside the gap is stored again, so it stays fixed.
+        if test_pos().is_none() && saved.is_some_and(|p| p != (a.pill_left(), a.top_y)) {
+            settings::save_pos(a.pill_left(), a.top_y);
+        }
         a
     }
 
@@ -381,7 +387,7 @@ impl App {
     fn place_default(&mut self, work: &RECT) {
         self.frac = 0.5;
         self.win_x = (work.left + work.right) / 2 - self.win_w / 2;
-        self.top_y = work.top + (12.0 * self.scale).round() as i32;
+        self.top_y = work.top + (EDGE_GAP * self.scale).round() as i32;
     }
 
     fn win_y(&self) -> i32 {
@@ -393,17 +399,19 @@ impl App {
         self.win_x + self.gm + ((MAX_W - self.width.target) * self.frac * self.scale).round() as i32
     }
 
+    /// Keeps the pill at least `EDGE_GAP` logical px inside the work area on every side (the liquid
+    /// show needs a real gap to an edge). Every position change (load, drag, DPI, display, reset) ends here.
     fn clamp_to_monitor(&mut self) {
         let left = self.pill_left();
         let wpx = (self.width.target * self.scale).round() as i32;
         let (work, _) = work_area(left + wpx / 2, self.top_y, false);
-        if left < work.left {
-            self.win_x += work.left - left;
-        } else if left + wpx > work.right {
-            self.win_x -= left + wpx - work.right;
-        }
+        let gap = (EDGE_GAP * self.scale).round() as i32;
+        let (lo, hi) = (work.left + gap, work.right - gap - wpx);
+        let dx = left.min(hi.max(lo)).max(lo) - left;
+        self.win_x += dx;
         let hpx = (PILL_H * self.scale).round() as i32;
-        self.top_y = self.top_y.min(work.bottom - hpx).max(work.top);
+        let (lo, hi) = (work.top + gap, work.bottom - gap - hpx);
+        self.top_y = self.top_y.min(hi.max(lo)).max(lo);
         self.update_zone();
     }
 
