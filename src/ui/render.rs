@@ -17,6 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, UpdateLayered
 use windows_numerics::{Matrix3x2, Vector2};
 
 use super::layout::*;
+use super::liquid::{self, Edge, Shape};
 use crate::model::{Cover, DeviceKind, Part, PartKind};
 
 /// One device slot, already animated: `e` is presence (fade/slide in and out),
@@ -57,6 +58,15 @@ pub struct WaveDraw {
     pub rgb: Option<[u8; 3]>,
 }
 
+/// The pill emerging from a screen edge (see `liquid`): everything in window-logical px.
+pub struct Liquid {
+    pub edge: Edge,
+    /// The edge line and the rest rect's centre.
+    pub line: f32,
+    pub centre: (f32, f32),
+    pub sh: Shape,
+}
+
 pub struct Frame {
     pub s: f32,
     pub pill: Rect,
@@ -88,6 +98,8 @@ pub struct Frame {
     /// Left edge of the right-hand text section (it moves right to make room for the waveform).
     pub text_l: f32,
     pub wave: Option<WaveDraw>,
+    /// `Some` while the pill is on its way in or out of an edge (replaces `vis` / `vis_scale`).
+    pub liquid: Option<Liquid>,
 }
 
 /// Text layout reused until its string, format or box size changes.
@@ -187,6 +199,17 @@ fn mul(a: &Matrix3x2, b: &Matrix3x2) -> Matrix3x2 {
 
 fn col(hex: u32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r: ((hex >> 16) & 255) as f32 / 255.0, g: ((hex >> 8) & 255) as f32 / 255.0, b: (hex & 255) as f32 / 255.0, a }
+}
+
+fn merge(a: RECT, b: RECT) -> RECT {
+    let empty = |r: &RECT| r.right <= r.left || r.bottom <= r.top;
+    if empty(&a) {
+        b
+    } else if empty(&b) {
+        a
+    } else {
+        RECT { left: a.left.min(b.left), top: a.top.min(b.top), right: a.right.max(b.right), bottom: a.bottom.max(b.bottom) }
+    }
 }
 
 fn rf(r: Rect) -> D2D_RECT_F {
@@ -604,19 +627,21 @@ impl Renderer {
         self.sync_covers(&f.cover, &f.prev_cover);
         // Physical-px bounding box of this frame (pill + glow), merged with the last one.
         let m = GLOW + 2.0;
-        let cur = RECT {
-            left: (((f.pill.l - m) * f.s).floor() as i32).clamp(0, self.w),
-            top: (((f.pill.t - m) * f.s).floor() as i32).clamp(0, self.h),
-            right: (((f.pill.r + m) * f.s).ceil() as i32).clamp(0, self.w),
-            bottom: (((f.pill.b + m) * f.s).ceil() as i32).clamp(0, self.h),
+        let px = |r: Rect| RECT {
+            left: ((r.l * f.s).floor() as i32).clamp(0, self.w),
+            top: ((r.t * f.s).floor() as i32).clamp(0, self.h),
+            right: ((r.r * f.s).ceil() as i32).clamp(0, self.w),
+            bottom: ((r.b * f.s).ceil() as i32).clamp(0, self.h),
+        };
+        let cur = match &f.liquid {
+            Some(l) => match l.sh.extent(m) {
+                Some((n1, th)) => px(liquid::map_rect(l.edge, l.line, l.centre, (0.0, n1), th)),
+                None => RECT::default(),
+            },
+            None => px(Rect { l: f.pill.l - m, t: f.pill.t - m, r: f.pill.r + m, b: f.pill.b + m }),
         };
         let rc = match self.dirty {
-            Some(o) => RECT {
-                left: o.left.min(cur.left),
-                top: o.top.min(cur.top),
-                right: o.right.max(cur.right),
-                bottom: o.bottom.max(cur.bottom),
-            },
+            Some(o) => merge(o, cur),
             None => RECT { left: 0, top: 0, right: self.w, bottom: self.h },
         };
         self.dirty = Some(cur);
@@ -631,30 +656,28 @@ impl Renderer {
             self.changed = rc;
             self.rt.BeginDraw();
             self.set_xf(None);
-            // Glow: a few wide strokes with a quadratic falloff.
-            const BANDS: i32 = 3;
-            let bw = GLOW / BANDS as f32;
-            for i in 0..BANDS {
-                let t = (i as f32 + 0.5) / BANDS as f32;
-                let grow = (i as f32 + 0.5) * bw;
-                let r = Rect { l: f.pill.l - grow, t: f.pill.t - grow, r: f.pill.r + grow, b: f.pill.b + grow };
-                self.rt.DrawRoundedRectangle(&rr(r, f.radius + grow), self.color(0xFFFFFF, 0.06 * (1.0 - t) * (1.0 - t)), bw, None);
+            match &f.liquid {
+                Some(l) => self.liquid(f, l, &g),
+                None => {
+                    // Glow: a few wide strokes with a quadratic falloff.
+                    const BANDS: i32 = 3;
+                    let bw = GLOW / BANDS as f32;
+                    for i in 0..BANDS {
+                        let t = (i as f32 + 0.5) / BANDS as f32;
+                        let grow = (i as f32 + 0.5) * bw;
+                        let r = Rect { l: f.pill.l - grow, t: f.pill.t - grow, r: f.pill.r + grow, b: f.pill.b + grow };
+                        self.rt.DrawRoundedRectangle(&rr(r, f.radius + grow), self.color(0xFFFFFF, 0.06 * (1.0 - t) * (1.0 - t)), bw, None);
+                    }
+                    self.fill(f.pill, f.radius, 0x000000, 1.0);
+                    self.stroke_rr(
+                        Rect { l: f.pill.l + 0.5, t: f.pill.t + 0.5, r: f.pill.r - 0.5, b: f.pill.b - 0.5 },
+                        f.radius - 0.5,
+                        0xFFFFFF,
+                        0.06,
+                    );
+                    self.content(f, &g, f.pill);
+                }
             }
-            self.fill(f.pill, f.radius, 0x000000, 1.0);
-            self.stroke_rr(
-                Rect { l: f.pill.l + 0.5, t: f.pill.t + 0.5, r: f.pill.r - 0.5, b: f.pill.b - 0.5 },
-                f.radius - 0.5,
-                0xFFFFFF,
-                0.06,
-            );
-
-            self.rt.PushAxisAlignedClip(&rf(f.pill), D2D1_ANTIALIAS_MODE_ALIASED);
-            self.row1(f, &g);
-            if f.content > 0.01 {
-                self.block(f, &g);
-                self.parts_rows(f);
-            }
-            self.rt.PopAxisAlignedClip();
             self.set_xf(None);
 
             let res = self.rt.EndDraw(None, None);
@@ -667,6 +690,115 @@ impl Renderer {
             }
         }
         true
+    }
+
+    /// Everything inside the pill, clipped to `clip` (window-logical px, under the current group).
+    fn content(&self, f: &Frame, g: &Geo, clip: Rect) {
+        // SAFETY: balanced with the pop below.
+        unsafe { self.rt.PushAxisAlignedClip(&rf(clip), D2D1_ANTIALIAS_MODE_ALIASED) };
+        self.row1(f, g);
+        if f.content > 0.01 {
+            self.block(f, g);
+            self.parts_rows(f);
+        }
+        // SAFETY: matches the push above.
+        unsafe { self.rt.PopAxisAlignedClip() };
+    }
+
+    /// Body + neck of the liquid pill as one outline, in edge axes (x = n, y = t).
+    fn silhouette(&self, sh: &Shape) -> windows::core::Result<ID2D1Geometry> {
+        // SAFETY: plain geometry construction; every sink is closed before its geometry is used.
+        unsafe {
+            let body = self.d2d.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F { left: sh.near, top: -sh.along / 2.0, right: sh.near + sh.depth, bottom: sh.along / 2.0 },
+                radiusX: sh.r,
+                radiusY: sh.r,
+            })?;
+            if sh.near <= 0.0 || sh.c < 0.5 {
+                return body.cast();
+            }
+            // Neck: a band of width c from the edge line into the body, flared by a meniscus at the edge.
+            let (h, rs) = (sh.c / 2.0, sh.rs);
+            let end = (sh.near + sh.r).max(rs);
+            let v = |x: f32, y: f32| Vector2 { X: x, Y: y };
+            let q = |cx: f32, cy: f32, x: f32, y: f32| D2D1_QUADRATIC_BEZIER_SEGMENT { point1: v(cx, cy), point2: v(x, y) };
+            let neck = self.d2d.CreatePathGeometry()?;
+            let sink = neck.Open()?;
+            sink.BeginFigure(v(0.0, -h - rs), D2D1_FIGURE_BEGIN_FILLED);
+            sink.AddQuadraticBezier(&q(0.0, -h, rs, -h));
+            sink.AddLine(v(end, -h));
+            sink.AddLine(v(end, h));
+            sink.AddLine(v(rs, h));
+            sink.AddQuadraticBezier(&q(0.0, h, 0.0, h + rs));
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink.Close()?;
+            let out = self.d2d.CreatePathGeometry()?;
+            let sink = out.Open()?;
+            body.CombineWithGeometry(&neck, D2D1_COMBINE_MODE_UNION, None, 0.1, &sink)?;
+            sink.Close()?;
+            out.cast()
+        }
+    }
+
+    /// The pill on its way through an edge: clipped at the edge line, a body with a neck
+    /// stretching back to the edge, and the content riding on (or clipped to) the body.
+    fn liquid(&mut self, f: &Frame, l: &Liquid, g: &Geo) {
+        let sh = &l.sh;
+        let win = (self.w as f32 / f.s, self.h as f32 / f.s);
+        self.group = ident();
+        self.ga = 1.0;
+        // SAFETY: balanced clip, valid pointers.
+        unsafe {
+            self.set_xf(None);
+            self.rt.PushAxisAlignedClip(&rf(liquid::clip_rect(l.edge, l.line, win)), D2D1_ANTIALIAS_MODE_ALIASED);
+            if sh.extent(0.0).is_some() {
+                let m = liquid::edge_matrix(l.edge, l.line, l.centre);
+                let xf = Matrix3x2 { M11: m[0], M12: m[1], M21: m[2], M22: m[3], M31: m[4], M32: m[5] };
+                self.rt.SetTransform(&mul(&xf, &self.base));
+                if sh.glow > 0.001 {
+                    const BANDS: i32 = 3;
+                    let bw = GLOW / BANDS as f32;
+                    for i in 0..BANDS {
+                        let t = (i as f32 + 0.5) / BANDS as f32;
+                        let grow = (i as f32 + 0.5) * bw;
+                        let rect = D2D_RECT_F {
+                            left: sh.near - grow,
+                            top: -sh.along / 2.0 - grow,
+                            right: sh.near + sh.depth + grow,
+                            bottom: sh.along / 2.0 + grow,
+                        };
+                        let rr = D2D1_ROUNDED_RECT { rect, radiusX: sh.r + grow, radiusY: sh.r + grow };
+                        self.rt.DrawRoundedRectangle(&rr, self.color(0xFFFFFF, 0.06 * (1.0 - t) * (1.0 - t) * sh.glow), bw, None);
+                    }
+                }
+                if let Ok(geom) = self.silhouette(sh) {
+                    self.rt.FillGeometry(&geom, self.color(0x000000, 1.0), None::<&ID2D1Brush>);
+                    self.rt.DrawGeometry(&geom, self.color(0xFFFFFF, 0.06), 1.0, None::<&ID2D1StrokeStyle>);
+                }
+                if sh.content > 0.01 {
+                    let (sx, sy, dx, dy) = sh.content_xf(l.edge);
+                    self.group = Matrix3x2 {
+                        M11: sx,
+                        M12: 0.0,
+                        M21: 0.0,
+                        M22: sy,
+                        M31: l.centre.0 * (1.0 - sx) + dx,
+                        M32: l.centre.1 * (1.0 - sy) + dy,
+                    };
+                    self.ga = sh.content;
+                    self.set_xf(None);
+                    let clip = if l.edge.vertical() {
+                        let b = sh.body_rect(l.edge, l.line, l.centre);
+                        Rect { l: f.pill.l.max(b.l), t: f.pill.t.max(b.t), r: f.pill.r.min(b.r), b: f.pill.b.min(b.b) }
+                    } else {
+                        f.pill
+                    };
+                    self.content(f, g, clip);
+                }
+            }
+            self.set_xf(None);
+            self.rt.PopAxisAlignedClip();
+        }
     }
 
     fn press_of(f: &Frame, c: Ctl) -> f32 {

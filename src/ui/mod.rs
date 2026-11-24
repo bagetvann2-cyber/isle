@@ -5,6 +5,7 @@
 //! animates; when everything has settled the thread parks on a channel and nothing runs.
 
 pub mod layout;
+mod liquid;
 mod render;
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicPtr, AtomicU32, AtomicU8, Ordering};
@@ -39,7 +40,8 @@ use crate::media::MediaHandle;
 use crate::model::{Cover, Device, MediaCommand, MediaSnapshot, Part, PartKind};
 use crate::settings;
 use layout::*;
-use render::{Ctl, DevDraw, Frame, PartsRow, Renderer, WaveDraw};
+use liquid::{choose_edge, edge_line, shape, Edge, IRect, RestBox};
+use render::{Ctl, DevDraw, Frame, Liquid, PartsRow, Renderer, WaveDraw};
 
 pub const WM_APP_MEDIA: u32 = WM_APP + 1;
 pub const WM_APP_DEVICES: u32 = WM_APP + 2;
@@ -201,6 +203,10 @@ struct App {
     open: Spring,
     width: Spring,
     vis: Spring,
+    /// Same target as `vis`, softer spring: the pair drives the liquid squash.
+    q: Spring,
+    /// Edge the pill emerges from (and its screen coordinate), chosen at the start of a show / hide.
+    edge: Option<(Edge, i32)>,
     press: Spring,
     press_ctl: Option<Ctl>,
     content: Tween,
@@ -275,7 +281,7 @@ impl App {
     fn new(shared: Arc<Shared>) -> App {
         let now = Instant::now();
         let ru = unsafe { GetUserDefaultUILanguage() } & 0x3FF == 0x19;
-        let saved = settings::load_pos();
+        let saved = test_pos().or_else(settings::load_pos);
         let (work, dpi) = match saved {
             Some((x, y)) => work_area(x, y, false),
             None => work_area(0, 0, true),
@@ -298,6 +304,8 @@ impl App {
             open: Spring::new(0.0, 0.42, 0.78),
             width: Spring::new(MIN_W, 0.40, 0.80),
             vis: Spring::new(0.0, 0.30, 0.85),
+            q: Spring::new(0.0, 0.30, 0.85),
+            edge: None,
             press: Spring::new(1.0, 0.18, 0.70),
             press_ctl: None,
             content: Tween::at(0.0, now),
@@ -344,7 +352,6 @@ impl App {
             prev_cover: None,
             devs: Vec::new(),
         };
-        a.vis.target = 1.0;
         a.recompute_size();
         match saved {
             Some((x, y)) => {
@@ -360,7 +367,8 @@ impl App {
 
     fn recompute_size(&mut self) {
         let s = self.scale;
-        self.gm = (GLOW * s).ceil() as i32;
+        // Glow plus a collapsed-pill-high margin: the liquid pill travels between the edge and its rest spot.
+        self.gm = ((GLOW + PILL_H) * s).ceil() as i32;
         self.win_w = (MAX_W * s).ceil() as i32 + 2 * self.gm;
         self.win_h = ((EXP_H + PART_ROW_H * MAX_PART_ROWS as f32) * s).ceil() as i32 + 2 * self.gm;
     }
@@ -430,10 +438,17 @@ impl App {
         }
     }
 
+    /// Both show / hide springs at rest. The liquid shape squashes by `0.6 * (vis - q)`, so it needs a
+    /// tighter tolerance than the plain fade for the last frame to match the settled pill.
+    fn vis_settled(&self) -> bool {
+        let (e, ev) = if self.edge.is_some() { (0.001, 0.01) } else { (0.004, 0.02) };
+        self.vis.settled(e, ev) && self.q.settled(e, ev)
+    }
+
     fn is_animating(&self, now: Instant) -> bool {
         !self.open.settled(0.004, 0.02)
             || !self.width.settled(0.5, 2.0)
-            || !self.vis.settled(0.004, 0.02)
+            || !self.vis_settled()
             || (self.press_ctl.is_some() && !self.press.settled(0.002, 0.02))
             || self.collapse_at.is_some()
             || !self.content.done(now)
@@ -450,6 +465,7 @@ impl App {
         self.open.step(dt);
         self.width.step(dt);
         self.vis.step(dt);
+        self.q.step(dt);
         self.press.step(dt);
         if self.collapse_at.is_some_and(|t| now >= t) {
             self.collapse_at = None;
@@ -465,8 +481,14 @@ impl App {
         if self.width.settled(0.5, 2.0) {
             self.width.snap();
         }
-        if self.vis.settled(0.004, 0.02) {
+        if self.vis_settled() {
             self.vis.snap();
+            self.q.snap();
+        }
+        // Liquid hide: once the body is beyond the edge, the springs' long tails would only repaint nothing.
+        if self.edge.is_some() && self.vis.target == 0.0 && self.vis.x < 0.02 && self.q.x < 0.3 {
+            self.vis.snap();
+            self.q.snap();
         }
         if self.press.settled(0.002, 0.02) {
             self.press.snap();
@@ -475,7 +497,7 @@ impl App {
             }
         }
         self.devs.retain(|d| !(d.removing && d.pres.done(now)));
-        if self.vis.target == 0.0 && self.vis.x == 0.0 && self.shown {
+        if self.vis.target == 0.0 && self.vis.x == 0.0 && self.q.x == 0.0 && self.shown {
             self.shown = false;
             // SAFETY: hides our own window.
             unsafe {
@@ -703,6 +725,24 @@ impl App {
         (pill, radius, geo(left, w, row1, block), row1, block)
     }
 
+    /// The liquid state of this frame; `None` at rest (the plain renderer takes over) or without an edge.
+    fn liquid_frame(&self, pill: Rect, radius: f32) -> Option<Liquid> {
+        let (edge, line_px) = self.edge?;
+        if self.vis.x == 1.0 && self.q.x == 1.0 {
+            return None;
+        }
+        let s = self.scale;
+        let line = if edge.vertical() { (line_px - self.win_x) as f32 / s } else { (line_px - self.win_y()) as f32 / s };
+        let g = match edge {
+            Edge::Top => pill.t - line,
+            Edge::Bottom => line - pill.b,
+            Edge::Left => pill.l - line,
+            Edge::Right => line - pill.r,
+        };
+        let b = RestBox { w: pill.w(), h: pill.b - pill.t, hc: PILL_H, g, r: radius, rs_max: liquid::SHOULDER / UI_SCALE };
+        Some(Liquid { edge, line, centre: ((pill.l + pill.r) / 2.0, (pill.t + pill.b) / 2.0), sh: shape(edge, &b, self.vis.x, self.q.x) })
+    }
+
     fn frame(&self, now: Instant) -> Frame {
         let (pill, radius, _, row1, block) = self.geometry();
         let m = self.media.as_ref();
@@ -765,6 +805,7 @@ impl App {
             progress,
             text_l: text_l(self.wave_on && self.media.is_some()),
             wave: self.wave_draw(now),
+            liquid: self.liquid_frame(pill, radius),
         }
     }
 
@@ -960,6 +1001,9 @@ impl App {
                     self.frac = 0.0;
                 }
                 self.press.target = 1.0;
+                // The pill is user-placed now: drop any liquid motion (its edge line would go stale).
+                self.vis.snap();
+                self.q.snap();
             }
             if d.moved {
                 self.win_x = d.win_x + dx;
@@ -1254,22 +1298,72 @@ impl App {
 
     fn apply_visibility(&mut self) {
         let want = !self.fs_hidden && (self.always_visible || self.zone_active || self.menu_open || self.drag.is_some());
-        if want {
-            self.vis.target = 1.0;
-            if !self.shown {
-                self.shown = true;
-                // SAFETY: shows our own window without activating it.
-                unsafe {
-                    let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
-                }
-                self.sync_progress_timer();
+        self.set_vis(want);
+        if want && !self.shown {
+            self.shown = true;
+            // SAFETY: shows our own window without activating it.
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
             }
-        } else {
-            self.vis.target = 0.0;
+            self.sync_progress_timer();
         }
         self.sync_wave();
         self.sync_live();
         self.kick();
+    }
+
+    /// Start or reverse the show / hide motion. The edge is picked only when starting from rest;
+    /// a reversal keeps it (and the velocity of both springs).
+    fn set_vis(&mut self, show: bool) {
+        let t = if show { 1.0 } else { 0.0 };
+        if self.vis.target == t {
+            return;
+        }
+        if self.vis_settled() {
+            self.edge = self.pick_edge();
+        }
+        self.vis.target = t;
+        self.q.target = t;
+        let ((pr, pz), (qr, qz)) = match (self.edge.is_some(), show) {
+            (true, true) => ((0.42, 0.78), (0.5, 0.65)),
+            (true, false) => ((0.35, 1.0), (0.5, 1.0)),
+            (false, _) => ((0.30, 0.85), (0.30, 0.85)),
+        };
+        self.vis.tune(pr, pz);
+        self.q.tune(qr, qz);
+    }
+
+    /// The screen edge the pill should emerge from, from its rest rect and the monitor it is on.
+    fn pick_edge(&self) -> Option<(Edge, i32)> {
+        if test_knob("ISLE_NO_LIQUID") || !client_animations() {
+            return None;
+        }
+        let s = self.scale;
+        let (pill, ..) = self.geometry();
+        let (ox, oy) = (self.win_x, self.win_y());
+        let rest = IRect {
+            l: ox + (pill.l * s).round() as i32,
+            t: oy + (pill.t * s).round() as i32,
+            r: ox + (pill.r * s).round() as i32,
+            b: oy + (pill.b * s).round() as i32,
+        };
+        let r = RECT { left: rest.l, top: rest.t, right: rest.r, bottom: rest.b };
+        // SAFETY: plain monitor queries with valid pointers.
+        let (work, mon) = unsafe {
+            let m = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            if !GetMonitorInfoW(m, &mut mi).as_bool() {
+                return None;
+            }
+            let ir = |r: RECT| IRect { l: r.left, t: r.top, r: r.right, b: r.bottom };
+            (ir(mi.rcWork), ir(mi.rcMonitor))
+        };
+        let hc = (PILL_H * s).round() as i32;
+        let min_gap = (liquid::MIN_GAP * s / UI_SCALE).round() as i32;
+        // SAFETY: point query only.
+        let other = |x, y| unsafe { !MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONULL).is_invalid() };
+        let e = choose_edge(rest, work, mon, hc, min_gap, other)?;
+        Some((e, edge_line(e, work)))
     }
 
     /// Cursor entered / left the reveal zone (posted by the mouse hook).
@@ -1398,6 +1492,26 @@ fn perf_log(line: &str) {
 /// Test switches (env vars) only exist in debug builds; release builds ignore them.
 fn test_knob(name: &str) -> bool {
     cfg!(debug_assertions) && std::env::var_os(name).is_some()
+}
+
+/// Debug-only: `ISLE_TEST_POS=x,y` places the pill (physical px) without touching the saved position.
+fn test_pos() -> Option<(i32, i32)> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let v = std::env::var("ISLE_TEST_POS").ok()?;
+    let (x, y) = v.split_once(',')?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
+/// "Animation effects" in Windows settings (off: the pill keeps the plain fade).
+fn client_animations() -> bool {
+    let mut on: i32 = 1;
+    // SAFETY: SPI_GETCLIENTAREAANIMATION writes one BOOL (an i32) through the pointer.
+    let ok = unsafe {
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, Some(&mut on as *mut i32 as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0))
+    };
+    ok.is_err() || on != 0
 }
 
 unsafe fn fullscreen_active(own: HWND) -> bool {
