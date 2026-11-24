@@ -130,6 +130,18 @@ pub fn banner_items(a: &Alert, dev: Option<&Device>, timer_total_ms: u64, ru: bo
             let total = crate::clock::label(&crate::clock::Clock::Timer { deadline_ms: timer_total_ms, total_ms: timer_total_ms }, 0);
             vec![Item::Glyph('\u{E916}', ORANGE), text(if ru { "Таймер завершён" } else { "Timer done" }, WHITE), text(total, GREY)]
         }
+        Alert::UpdateAvailable { version } => {
+            let s = if ru {
+                format!("Доступно обновление {version} \u{B7} нажмите")
+            } else {
+                format!("Update {version} available \u{B7} click")
+            };
+            vec![Item::Glyph('\u{E896}', LIGHT), text(s, WHITE)]
+        }
+        Alert::Updating => vec![Item::Glyph('\u{E895}', LIGHT), text(if ru { "Обновление\u{2026}" } else { "Updating\u{2026}" }, WHITE)],
+        Alert::UpdateFailed => {
+            vec![Item::Glyph('\u{E7BA}', ORANGE), text(if ru { "Не удалось обновить" } else { "Update failed" }, WHITE)]
+        }
     }
 }
 
@@ -270,6 +282,17 @@ mod tests {
         assert_eq!(texts(&v), vec![("Timer done".into(), WHITE), ("05:00".into(), GREY)]);
         let v = banner_items(&Alert::TimerDone, None, 3_600_000, true);
         assert_eq!(texts(&v)[1].0, "1:00:00");
+    }
+
+    #[test]
+    fn update_texts() {
+        let a = Alert::UpdateAvailable { version: "0.3.0".into() };
+        assert_eq!(texts(&banner_items(&a, None, 0, true)), vec![("Доступно обновление 0.3.0 \u{B7} нажмите".into(), WHITE)]);
+        assert_eq!(texts(&banner_items(&a, None, 0, false)), vec![("Update 0.3.0 available \u{B7} click".into(), WHITE)]);
+        assert_eq!(texts(&banner_items(&Alert::Updating, None, 0, true))[0].0, "Обновление\u{2026}");
+        assert_eq!(texts(&banner_items(&Alert::Updating, None, 0, false))[0].0, "Updating\u{2026}");
+        assert_eq!(texts(&banner_items(&Alert::UpdateFailed, None, 0, true))[0].0, "Не удалось обновить");
+        assert_eq!(texts(&banner_items(&Alert::UpdateFailed, None, 0, false))[0].0, "Update failed");
     }
 
     #[test]

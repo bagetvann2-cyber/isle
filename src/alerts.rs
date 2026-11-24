@@ -7,11 +7,28 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Alert {
-    DeviceConnected { id: String },
-    DeviceLow { id: String, level: u8 },
-    Power { plugged: bool, percent: u8 },
-    LaptopLow { percent: u8 },
+    DeviceConnected {
+        id: String,
+    },
+    DeviceLow {
+        id: String,
+        level: u8,
+    },
+    Power {
+        plugged: bool,
+        percent: u8,
+    },
+    LaptopLow {
+        percent: u8,
+    },
     TimerDone,
+    /// A newer release is out (`version` as displayed, e.g. "0.3.0"). Shown without a sound.
+    UpdateAvailable {
+        version: String,
+    },
+    /// Banner-only states of a user-started install; the UI shows them itself, they never enter the queue.
+    Updating,
+    UpdateFailed,
 }
 
 const CONNECT_COOLDOWN_MS: u64 = 60_000;
@@ -140,6 +157,9 @@ fn ttl(a: &Alert) -> Option<u64> {
         Alert::DeviceConnected { .. } | Alert::Power { .. } => Some(TTL_SHORT_MS),
         Alert::DeviceLow { .. } | Alert::LaptopLow { .. } => Some(TTL_LONG_MS),
         Alert::TimerDone => None,
+        // Offered for 5 min; if the island could not show it by then, the menu item is still there.
+        Alert::UpdateAvailable { .. } => Some(TTL_LONG_MS),
+        Alert::Updating | Alert::UpdateFailed => Some(TTL_SHORT_MS),
     }
 }
 
@@ -148,7 +168,13 @@ fn same_slot(a: &Alert, b: &Alert) -> bool {
     use Alert::*;
     match (a, b) {
         (DeviceConnected { id: x }, DeviceConnected { id: y }) | (DeviceLow { id: x, .. }, DeviceLow { id: y, .. }) => x == y,
-        (Power { .. }, Power { .. }) | (LaptopLow { .. }, LaptopLow { .. }) | (TimerDone, TimerDone) => true,
+        (Power { .. }, Power { .. })
+        | (LaptopLow { .. }, LaptopLow { .. })
+        | (TimerDone, TimerDone)
+        | (Updating, Updating)
+        | (UpdateFailed, UpdateFailed) => true,
+        // Only the newest offer matters: a newer version replaces a queued older one.
+        (UpdateAvailable { .. }, UpdateAvailable { .. }) => true,
         _ => false,
     }
 }
@@ -466,6 +492,33 @@ mod tests {
         assert_eq!(q.current(3, true), Some(&conn("a")));
         q.dismiss();
         assert_eq!(q.current(4, true), Some(&Alert::TimerDone));
+    }
+
+    fn upd(v: &str) -> Alert {
+        Alert::UpdateAvailable { version: v.into() }
+    }
+
+    #[test]
+    fn update_offer_merges_and_expires() {
+        let mut q = Queue::default();
+        q.push(upd("0.3.0"), 0);
+        q.push(upd("0.3.0"), 10); // same version: one entry, timestamp refreshed
+        q.push(upd("0.4.0"), 20); // newer version replaces it in place
+        assert_eq!(q.current(20, true), Some(&upd("0.4.0")));
+        q.dismiss();
+        assert!(q.current(20, true).is_none());
+        // Expires after 5 min even if never shown, but not before.
+        q.push(upd("0.4.0"), 0);
+        assert_eq!(q.current(299_999, false), None);
+        assert_eq!(q.current(299_999, true), Some(&upd("0.4.0")));
+        assert!(q.current(300_000, true).is_none());
+        q.dismiss(); // forget the expired one that was on screen
+                     // Queues behind other alerts.
+        q.push(conn("a"), 0);
+        q.push(upd("0.5.0"), 1);
+        assert_eq!(q.current(2, true), Some(&conn("a")));
+        q.dismiss();
+        assert_eq!(q.current(2, true), Some(&upd("0.5.0")));
     }
 
     #[test]

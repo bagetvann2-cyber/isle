@@ -113,3 +113,12 @@ pub fn alerts() -> bool {
 pub fn set_alerts(on: bool) {
     set_u32(w!("alerts"), on as u32);
 }
+
+/// Daily check for a newer release on GitHub; on by default.
+pub fn check_updates() -> bool {
+    get_u32(w!("check_updates")).unwrap_or(1) != 0
+}
+
+pub fn set_check_updates(on: bool) {
+    set_u32(w!("check_updates"), on as u32);
+}

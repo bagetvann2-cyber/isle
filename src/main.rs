@@ -14,12 +14,27 @@ mod ui;
 mod update;
 
 use std::io::Write;
+use std::sync::atomic::{AtomicIsize, Ordering};
 
 use windows::core::w;
-use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows::Win32::System::Console::{AttachConsole, GetStdHandle, ATTACH_PARENT_PROCESS, STD_OUTPUT_HANDLE};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+
+/// The single-instance mutex handle (0 = none), kept so an update can release it before the restarted exe starts.
+static INSTANCE_MUTEX: AtomicIsize = AtomicIsize::new(0);
+
+/// Close the single-instance mutex handle now, so the new process can take the mutex while this one exits.
+pub fn release_instance_mutex() {
+    let h = INSTANCE_MUTEX.swap(0, Ordering::AcqRel);
+    if h != 0 {
+        // SAFETY: the handle came from CreateMutexW in `main` and is closed exactly once (the swap took it).
+        unsafe {
+            let _ = CloseHandle(HANDLE(h as *mut _));
+        }
+    }
+}
 
 /// stdout if redirected, else the parent console (the exe is a GUI-subsystem binary).
 fn console_out() -> Option<Box<dyn Write>> {
@@ -106,7 +121,9 @@ fn main() {
                 (mutex, taken) = create();
             }
         }
-        let _mutex = mutex;
+        if let Ok(h) = mutex {
+            INSTANCE_MUTEX.store(h.0 as isize, Ordering::Release);
+        }
         if taken && !ui::test_knob("ISLE_TEST_NO_MUTEX") {
             return;
         }

@@ -46,6 +46,7 @@ use crate::media::MediaHandle;
 use crate::model::{Cover, Device, MediaCommand, MediaSnapshot, Part, PartKind};
 use crate::privacy::PrivacyState;
 use crate::settings;
+use crate::update::{self, Release, Version};
 use banner::Item;
 use layout::*;
 use liquid::{choose_edge, edge_line, shape, Edge, IRect, RestBox};
@@ -62,6 +63,7 @@ const WM_APP_FRAME: u32 = WM_APP + 3;
 const WM_APP_FOREGROUND: u32 = WM_APP + 4;
 const WM_APP_WAVE: u32 = WM_APP + 8;
 const WM_APP_PRIVACY: u32 = WM_APP + 9;
+const WM_APP_UPDATE: u32 = WM_APP + 10;
 
 /// Waveform pacing, shared with the `wave` helper thread: it posts `WM_APP_WAVE` every ~33 ms
 /// (`WAVE_FAST`, bars moving) or every 150 ms (`WAVE_POLL`, playing but silent) and parks on `WAVE_OFF`.
@@ -87,8 +89,16 @@ const T_CLOCK_TICK: usize = 8;
 const T_CLOCK_DUE: usize = 9;
 /// Debug-only: drives the scripted alert tests (`ISLE_TEST_FAKE_CONNECT`, `ISLE_TEST_POWER`).
 const T_TEST: usize = 10;
-/// How long a banner stays up.
+/// One-shot: time for the next update check (first 60 s after start, then every 24 h, re-armed after each check).
+const T_UPDATE: usize = 11;
+const CHECK_FIRST_MS: u32 = 60_000;
+const CHECK_EVERY_MS: u32 = 24 * 3_600_000;
+/// How long a banner stays up; update banners get longer, they are worth reading.
 const ALERT_MS: u32 = 3000;
+const UPDATE_ALERT_MS: u32 = 6000;
+const UPDATE_CLICK_GRACE: Duration = Duration::from_millis(700);
+/// A failed check is retried after this (the network may simply not be up yet).
+const CHECK_RETRY_MS: u32 = 3_600_000;
 /// Connect alerts are muted this long after resume / unlock (devices reappear then).
 const MUTE_MS: u64 = 15_000;
 
@@ -152,6 +162,55 @@ pub struct Shared {
     pub media: Mutex<Option<MediaSnapshot>>,
     pub devices: Mutex<Vec<Device>>,
     pub privacy: Mutex<PrivacyState>,
+    pub update: Mutex<Vec<UpdateMsg>>,
+}
+
+/// What the update worker threads report (paired with `WM_APP_UPDATE`).
+pub enum UpdateMsg {
+    /// A check finished: the newer release if any, or `Err` when it could not be done (logged by the worker).
+    Checked(Result<Option<Release>, ()>),
+    Installed(InstallResult),
+}
+
+pub enum InstallResult {
+    /// Downloaded, verified, swapped; the new exe is running and holds the mutex.
+    Restarted,
+    Failed,
+    /// The new exe is in place but could not be started: retrying would only destroy the rollback copy.
+    SwappedNoRestart,
+}
+
+/// The install the user started, shown outside the alert queue (it must show even with notifications off).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UpdateUi {
+    Working,
+    Failed,
+}
+
+/// Append a line to the debug log (`ISLE_PERF` knob, debug builds only; release builds log nothing).
+fn debug_log(line: &str) {
+    if test_knob("ISLE_PERF") {
+        perf_log(line);
+    }
+}
+
+/// Hand an update message to the UI thread.
+fn post_update(sh: &Shared, hw: isize, m: UpdateMsg) {
+    if let Ok(mut g) = sh.update.lock() {
+        g.push(m);
+    }
+    // SAFETY: posting to our own window; a destroyed window just drops the message.
+    unsafe {
+        let _ = PostMessageW(Some(HWND(hw as *mut _)), WM_APP_UPDATE, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// How long `a` stays on the banner before it goes (sticky ones never time out).
+fn alert_ms(a: &Alert) -> u32 {
+    match a {
+        Alert::UpdateAvailable { .. } | Alert::UpdateFailed => UPDATE_ALERT_MS,
+        _ => ALERT_MS,
+    }
 }
 
 /// `GetTickCount64`, the time base of `alerts` and `clock`.
@@ -186,10 +245,12 @@ struct ActiveBanner {
     /// (x, width) per item, and the total width, logical px.
     xs: Vec<(f32, f32)>,
     total: f32,
-    /// Stays until clicked (the timer); the others go after `ALERT_MS`.
+    /// Stays until clicked (the timer) or finished (the install); the others go after `alert_ms`.
     sticky: bool,
     /// False while it fades out.
     live: bool,
+    /// When it came up: an update offer ignores clicks for a moment, so a click aimed at something else never installs.
+    shown_at: Instant,
 }
 
 static APP: AtomicPtr<App> = AtomicPtr::new(std::ptr::null_mut());
@@ -354,6 +415,17 @@ struct App {
     timer_total_ms: u64,
     timer_sound: bool,
     power_notify: [isize; 2],
+
+    // updates
+    update_on: bool,
+    /// The newest release offered so far (menu item + install target).
+    update_rel: Option<Release>,
+    /// The last version announced with a banner: each version is announced once per run.
+    update_offered: Option<Version>,
+    update_ui: Option<UpdateUi>,
+    check_busy: bool,
+    /// `GetTickCount64` of the last finished check.
+    last_check: Option<u64>,
     test_n: u32,
     fake_connect: bool,
 
@@ -471,6 +543,12 @@ impl App {
             timer_total_ms: 0,
             timer_sound: false,
             power_notify: [0; 2],
+            update_on: settings::check_updates(),
+            update_rel: None,
+            update_offered: None,
+            update_ui: None,
+            check_busy: false,
+            last_check: None,
             test_n: 0,
             fake_connect: false,
             clock: Clock::Off,
@@ -1064,7 +1142,7 @@ bar {} {} {}
         }
         let near = |p: (f32, f32)| Rect::around(p.0, p.1, 32.0, 32.0).contains(x, y);
         let seekable = self.media.as_ref().is_some_and(|m| m.can_seek && m.duration_ms > 0);
-        // While a banner covers the compact row its controls are not there: a click on it only dismisses.
+        // While a banner covers the compact row its controls are not there: a click on it only dismisses (or, for an update offer, starts the install).
         let banner = self.banner_live();
         let expanded = self.content.target() == 1.0 && self.open.x > 0.9;
         let clock = Rect { l: pill.r - PAD - self.clk.x, t: row1, r: pill.r, b: row1 + PILL_H };
@@ -1291,7 +1369,7 @@ bar {} {} {}
                 self.stop_clock();
             }
         } else if d.hit == Hit::Pill && self.banner_live() {
-            self.finish_alert();
+            self.on_banner_click();
         } else if d.hit == Hit::Bar {
             let mut p = POINT::default();
             // SAFETY: valid out pointer.
@@ -1814,6 +1892,9 @@ const CLOCK_STOPWATCH: usize = 480;
 const CLOCK_STOP: usize = 481;
 /// Menu id of the notifications toggle.
 const ALERTS_CMD: usize = 6;
+/// Menu ids: install the known update, toggle the daily update check.
+const UPDATE_CMD: usize = 8;
+const CHECK_CMD: usize = 9;
 
 fn clock_cmd(id: usize) -> Option<ClockCmd> {
     match id {
@@ -1862,7 +1943,12 @@ impl App {
             self.queue = Queue::default();
         }
         let can = self.can_alert();
-        let head = self.queue.current(now_ms(), can).cloned();
+        let head = match self.update_ui {
+            // The install's own banner: user-started, so independent of the notifications switch.
+            Some(UpdateUi::Working) if self.screen.active() && !self.fs_hidden => Some(Alert::Updating),
+            Some(UpdateUi::Failed) if self.screen.active() && !self.fs_hidden => Some(Alert::UpdateFailed),
+            _ => self.queue.current(now_ms(), can).cloned(),
+        };
         let changed = match head {
             Some(a) if self.banner.as_ref().is_some_and(|b| b.live && b.alert == a) => false,
             Some(a) => {
@@ -1905,12 +1991,13 @@ impl App {
             Item::Case => banner::CASE_W,
             Item::Text { s, small, .. } => r.map_or(s.chars().count() as f32 * 9.0, |r| r.measure_banner(s, *small)),
         });
-        let sticky = a == Alert::TimerDone;
-        if sticky && !self.timer_sound {
+        let sticky = matches!(a, Alert::TimerDone | Alert::Updating);
+        if a == Alert::TimerDone && !self.timer_sound {
             self.timer_sound = true;
             play_notification();
         }
-        self.banner = Some(ActiveBanner { alert: a, items, xs, total, sticky, live: true });
+        let ms = alert_ms(&a);
+        self.banner = Some(ActiveBanner { alert: a, items, xs, total, sticky, live: true, shown_at: Instant::now() });
         self.banner_t.go(1.0, 0.22, Instant::now());
         self.alert_hold = false;
         self.alert_active = true;
@@ -1919,7 +2006,7 @@ impl App {
             if sticky {
                 let _ = KillTimer(Some(self.hwnd), T_ALERT);
             } else {
-                SetTimer(Some(self.hwnd), T_ALERT, ALERT_MS, None);
+                SetTimer(Some(self.hwnd), T_ALERT, ms, None);
             }
         }
         self.kick();
@@ -1943,10 +2030,15 @@ impl App {
 
     /// The banner is done (time up, or clicked): drop it from the queue and show the next one.
     fn finish_alert(&mut self) {
-        if self.banner.as_ref().is_some_and(|b| b.live && b.sticky) {
+        if self.update_ui == Some(UpdateUi::Working) {
+            return; // the install banner goes when the install ends
+        }
+        if self.banner.as_ref().is_some_and(|b| b.live && b.alert == Alert::TimerDone) {
             self.timer_sound = false;
         }
-        self.queue.dismiss();
+        if self.update_ui.take().is_none() {
+            self.queue.dismiss();
+        }
         self.banner_off();
         self.sync_alerts();
         self.update_width_target();
@@ -1972,6 +2064,160 @@ impl App {
                 self.finish_alert();
             }
         }
+    }
+
+    /// A click on the banner: an update offer starts the install, the install banner ignores it, the rest dismiss.
+    fn on_banner_click(&mut self) {
+        match self.banner.as_ref().map(|b| &b.alert) {
+            Some(Alert::Updating) => {}
+            Some(Alert::UpdateAvailable { .. }) => {
+                // A click right after the offer appeared (or a double click through queued banners) is not consent.
+                if self.banner.as_ref().is_some_and(|b| b.shown_at.elapsed() >= UPDATE_CLICK_GRACE) {
+                    self.queue.dismiss();
+                    self.start_update();
+                }
+            }
+            _ => self.finish_alert(),
+        }
+    }
+
+    // ---- updates ----
+
+    fn arm_update_check(&self, ms: u32) {
+        // SAFETY: one-shot timer on our own window.
+        unsafe {
+            SetTimer(Some(self.hwnd), T_UPDATE, ms, None);
+        }
+    }
+
+    /// Run `update::check` on a short-lived worker; the result comes back as `WM_APP_UPDATE`.
+    fn start_update_check(&mut self) {
+        if !self.update_on || self.check_busy || test_knob("ISLE_TEST_UPDATE") {
+            return;
+        }
+        self.check_busy = true;
+        let (sh, hw) = (self.shared.clone(), self.hwnd.0 as isize);
+        let spawned = std::thread::Builder::new().name("update-check".into()).spawn(move || {
+            let found = update::check(&Version::current()).map_err(|e| debug_log(&format!("update check failed: {e}\n")));
+            post_update(&sh, hw, UpdateMsg::Checked(found));
+        });
+        if spawned.is_err() {
+            // Could not start a worker: try again tomorrow.
+            self.check_busy = false;
+            self.arm_update_check(CHECK_EVERY_MS);
+        }
+    }
+
+    /// The T_UPDATE one-shot fired.
+    fn on_update_timer(&mut self) {
+        // SAFETY: timer on our own window.
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), T_UPDATE);
+        }
+        self.start_update_check();
+    }
+
+    /// Resume from sleep: the one-shot does not count sleep; if the last check is over a day old, check soon
+    /// (not at once: the network is usually not back yet).
+    fn on_resume_update(&mut self) {
+        let stale = self.last_check.is_some_and(|t| now_ms().saturating_sub(t) > CHECK_EVERY_MS as u64);
+        if self.update_on && stale && !self.check_busy {
+            self.arm_update_check(CHECK_FIRST_MS);
+        }
+    }
+
+    /// Debug-only fake release (`ISLE_TEST_UPDATE=<version>`): shows the banner and the menu item, installs nothing.
+    fn test_release() -> Option<Release> {
+        let v = Version::parse(&std::env::var("ISLE_TEST_UPDATE").ok().filter(|_| cfg!(debug_assertions))?)?;
+        Some(Release {
+            version: v,
+            tag: format!("v{v}"),
+            exe_url: "https://github.com/bagetvann2-cyber/isle/releases/download/test/isle.exe".into(),
+            sha256: None,
+            page_url: "https://github.com/bagetvann2-cyber/isle/releases/tag/test".into(),
+        })
+    }
+
+    /// Remember the newest release and announce each version once per run.
+    fn on_release_found(&mut self, rel: Release) {
+        let announce = self.update_offered != Some(rel.version);
+        self.update_offered = Some(rel.version);
+        let alert = Alert::UpdateAvailable { version: rel.version.to_string() };
+        self.update_rel = Some(rel);
+        if announce {
+            self.push_alerts(vec![alert]);
+        }
+    }
+
+    /// Install `update_rel` after an explicit click. Never called without one.
+    fn start_update(&mut self) {
+        let Some(rel) = self.update_rel.clone() else { return };
+        if self.update_ui == Some(UpdateUi::Working) {
+            return;
+        }
+        self.update_ui = Some(UpdateUi::Working);
+        let (sh, hw) = (self.shared.clone(), self.hwnd.0 as isize);
+        let spawned = std::thread::Builder::new().name("update-install".into()).spawn(move || {
+            let r = if test_knob("ISLE_TEST_UPDATE") {
+                // Test mode: nothing is downloaded; linger so the "Updating" banner can be seen, then fail.
+                std::thread::sleep(Duration::from_secs(3));
+                debug_log("update failed: test mode, nothing installed\n");
+                InstallResult::Failed
+            } else {
+                match update::download_and_install(&rel) {
+                    Err(e) => {
+                        debug_log(&format!("update failed: {e}\n"));
+                        InstallResult::Failed
+                    }
+                    Ok(()) => match update::restart() {
+                        Ok(()) => {
+                            // The new process is waiting for the mutex: release it here, not via the UI thread.
+                            crate::release_instance_mutex();
+                            InstallResult::Restarted
+                        }
+                        Err(e) => {
+                            debug_log(&format!("update installed but restart failed: {e}\n"));
+                            InstallResult::SwappedNoRestart
+                        }
+                    },
+                }
+            };
+            post_update(&sh, hw, UpdateMsg::Installed(r));
+        });
+        if spawned.is_err() {
+            self.update_ui = Some(UpdateUi::Failed);
+        }
+        self.sync_alerts();
+    }
+
+    /// Handle what the workers reported. True: the new exe is running, the caller must release the mutex and quit.
+    fn on_update_msgs(&mut self) -> bool {
+        let msgs = self.shared.update.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default();
+        for m in msgs {
+            match m {
+                UpdateMsg::Checked(found) => {
+                    self.check_busy = false;
+                    if found.is_ok() {
+                        self.last_check = Some(now_ms());
+                    }
+                    if self.update_on {
+                        self.arm_update_check(if found.is_ok() { CHECK_EVERY_MS } else { CHECK_RETRY_MS });
+                    }
+                    if let Ok(Some(rel)) = found {
+                        self.on_release_found(rel);
+                    }
+                }
+                UpdateMsg::Installed(InstallResult::Restarted) => return true,
+                UpdateMsg::Installed(r) => {
+                    if matches!(r, InstallResult::SwappedNoRestart) {
+                        self.update_rel = None; // already on disk: do not offer (and redo) it
+                    }
+                    self.update_ui = Some(UpdateUi::Failed);
+                    self.sync_alerts();
+                }
+            }
+        }
+        false
     }
 
     /// AC / battery level changed (power-setting notification): read the status and feed the tracker.
@@ -2137,6 +2383,11 @@ impl App {
         let n = self.test_n;
         self.test_n += 1;
         let mut more = false;
+        if n == 0 {
+            if let Some(rel) = Self::test_release() {
+                self.on_release_found(rel);
+            }
+        }
         if test_knob("ISLE_TEST_FAKE_CONNECT") {
             self.fake_connect = n == 0;
             self.on_devices();
@@ -2321,6 +2572,16 @@ unsafe fn show_menu(hwnd: HWND) {
         ("Start with Windows", "Reset position", "Exit", "Always visible", "Show waveform", "Size")
     };
     let Ok(menu) = CreatePopupMenu() else { return };
+    // Only while an update is known; grayed while one is installing.
+    let t_upd = app()
+        .update_rel
+        .as_ref()
+        .map(|r| wide0(&if ru { format!("Обновить до {}", r.version) } else { format!("Update to {}", r.version) }));
+    if let Some(t) = &t_upd {
+        let f = if app().update_ui == Some(UpdateUi::Working) { MF_STRING | MF_GRAYED } else { MF_STRING };
+        let _ = AppendMenuW(menu, f, UPDATE_CMD, PCWSTR(t.as_ptr()));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    }
     let (a, b, c, d, e) = (wide0(t_auto), wide0(t_reset), wide0(t_exit), wide0(t_vis), wide0(t_wave));
     let flags = if settings::autostart_enabled() { MF_STRING | MF_CHECKED } else { MF_STRING };
     let _ = AppendMenuW(menu, flags, 1, PCWSTR(a.as_ptr()));
@@ -2331,6 +2592,9 @@ unsafe fn show_menu(hwnd: HWND) {
     let t_notif = tr("Уведомления", "Notifications");
     let nflags = if app().alerts_on { MF_STRING | MF_CHECKED } else { MF_STRING };
     let _ = AppendMenuW(menu, nflags, ALERTS_CMD, PCWSTR(t_notif.as_ptr()));
+    let t_chk = tr("Проверять обновления", "Check for updates");
+    let cflags = if app().update_on { MF_STRING | MF_CHECKED } else { MF_STRING };
+    let _ = AppendMenuW(menu, cflags, CHECK_CMD, PCWSTR(t_chk.as_ptr()));
     let (t_timer, t_sw, t_stop) = (tr("Таймер", "Timer"), tr("Секундомер", "Stopwatch"), tr("Остановить", "Stop"));
     let mins: Vec<Vec<u16>> = CLOCK_MINUTES.iter().map(|m| wide0(&if ru { format!("{m} мин") } else { format!("{m} min") })).collect();
     if let Ok(sub) = CreatePopupMenu() {
@@ -2395,6 +2659,18 @@ unsafe fn show_menu(hwnd: HWND) {
             }
             a.sync_alerts();
         }
+        c if c as usize == UPDATE_CMD => a.start_update(),
+        c if c as usize == CHECK_CMD => {
+            a.update_on = !a.update_on;
+            settings::set_check_updates(a.update_on);
+            if a.update_on {
+                if !a.check_busy {
+                    a.arm_update_check(5000);
+                }
+            } else {
+                let _ = KillTimer(Some(hwnd), T_UPDATE);
+            }
+        }
         c if clock_cmd(c as usize).is_some() => {
             let now = now_ms();
             match clock_cmd(c as usize) {
@@ -2404,7 +2680,8 @@ unsafe fn show_menu(hwnd: HWND) {
                 None => {}
             }
         }
-        3 => {
+        // Not while an install runs: killing the worker between the two renames would leave no isle.exe.
+        3 if a.update_ui != Some(UpdateUi::Working) => {
             let _ = DestroyWindow(hwnd);
             return;
         }
@@ -2477,6 +2754,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             match wp.0 {
                 T_SIZE => a.save_size(),
                 T_ALERT => a.on_alert_timer(),
+                T_UPDATE => a.on_update_timer(),
                 T_CLOCK_TICK => a.on_clock_tick(),
                 T_CLOCK_DUE => a.on_clock_due(),
                 T_TEST => a.on_test_step(),
@@ -2528,6 +2806,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             app().on_privacy();
             LRESULT(0)
         }
+        WM_APP_UPDATE => {
+            if app().on_update_msgs() {
+                // The new exe is running and waits for the mutex: release it, then leave (WM_DESTROY removes the tray icon).
+                crate::release_instance_mutex();
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_APP_ZONE => {
             app().on_zone(wp.0 != 0);
             LRESULT(0)
@@ -2573,6 +2859,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 // The timer's one-shot does not count sleep: recompute (and fire if it ran out meanwhile).
                 a.clock_check();
+                a.on_resume_update();
             } else if wp.0 == PBT_POWERSETTINGCHANGE as usize && lp.0 != 0 {
                 // SAFETY: for this event lParam points to a POWERBROADCAST_SETTING for the call's duration.
                 let p = lp.0 as *const POWERBROADCAST_SETTING;
@@ -2722,9 +3009,12 @@ pub fn run() -> windows::core::Result<()> {
             if test_knob("ISLE_TEST_STOPWATCH") {
                 a.start_clock(Clock::Stopwatch { start_ms: now_ms() });
             }
-            if test_knob("ISLE_TEST_FAKE_CONNECT") || test_knob("ISLE_TEST_POWER") {
+            if test_knob("ISLE_TEST_FAKE_CONNECT") || test_knob("ISLE_TEST_POWER") || test_knob("ISLE_TEST_UPDATE") {
                 SetTimer(Some(hwnd), T_TEST, 4000, None);
             }
+        }
+        if a.update_on {
+            a.arm_update_check(CHECK_FIRST_MS);
         }
         a.update_zone();
         a.sync_hook(false);

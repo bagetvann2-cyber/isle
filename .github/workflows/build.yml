@@ -75,14 +75,26 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
       - uses: actions/download-artifact@v8
         with:
           name: isle
           path: dist
+
+      # The updater compares the tag with the exe's own version: a mismatch would offer the same update forever.
+      - name: Tag matches Cargo.toml
+        shell: bash
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $v"; exit 1; }
 
       - name: Publish release
         uses: softprops/action-gh-release@v3
         with:
           files: dist/isle.exe
           generate_release_notes: true
-          prerelease: true
+          # Normal tags are "latest" (what the updater reads); only a tag with a suffix like -beta stays a pre-release.
+          prerelease: ${{ contains(github.ref_name, '-') }}

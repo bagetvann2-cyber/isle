@@ -3,7 +3,6 @@
 //! Security model: HTTPS only (WinHTTP), redirects are followed by hand and every hop must stay on a GitHub host,
 //! and the new exe is installed only if its SHA-256 equals the `digest` GitHub published for the release asset.
 //! No threads or timers here; callers run `check` / `download_and_install` from a worker thread.
-#![allow(dead_code)] // the island banner / menu wiring lands in a later change
 
 use core::ffi::c_void;
 use std::fmt;
