@@ -22,7 +22,7 @@ A tiny Dynamic-Island-style pill for Windows: what's playing, and the battery of
 | Source | What you get | Status |
 |---|---|---|
 | Bluetooth Classic / LE (Windows battery property) | one percent per device, no charging info | works for devices Windows reports a battery for |
-| Earbud L / R / case over BLE adverts: Redmi / Xiaomi | left, right, case, charging | decoded from a real Redmi Buds 6 capture; L/R order inferred |
+| Earbud L / R / case over BLE adverts: Redmi / Xiaomi | left, right, case, charging | decoded from a real Redmi Buds 6 capture and checked live on Redmi Buds 6 (other Xiaomi models untested) |
 | Earbud L / R / case: Google Fast Pair | left, right, case, charging | decoded from the spec, checked against third-party adverts |
 | Earbud L / R / case: AirPods | left, right, case, charging | community-documented layout, **unverified** |
 | Logitech HID++ 2.0 (Unifying / Bolt / Lightspeed receivers, direct) | percent and charging | experimental, read-only queries, untested on hardware |
@@ -32,7 +32,7 @@ A tiny Dynamic-Island-style pill for Windows: what's playing, and the battery of
 
 No real mouse has been tested yet: Bluetooth mice should work through the Windows battery property; Logitech is untested.
 
-Earbud parts come from a short passive Bluetooth scan that runs when the island expands (at most every 30 s) and when a headset connects, including at app start. Charging is only shown where the source reports it (Logitech, Xbox controllers, BLE earbuds).
+Earbud parts come from a passive Bluetooth scan that listens only for the connected headset's vendor format. It runs continuously while the island is expanded, continuously for the first minute after it appears and then 4 s every 30 s while it stays shown, and once when a headset connects (including at app start). While the island is hidden, nothing is scanned. When both buds are in your ears they stop advertising, so after 30 s of silence the island falls back to the single Windows percent. Charging is only shown where the source reports it (Logitech, Xbox controllers, BLE earbuds).
 
 ## Resource use
 
