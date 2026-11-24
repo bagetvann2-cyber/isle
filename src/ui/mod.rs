@@ -2118,7 +2118,7 @@ impl App {
         self.check_busy = true;
         let (sh, hw) = (self.shared.clone(), self.hwnd.0 as isize);
         let spawned = std::thread::Builder::new().name("update-check".into()).spawn(move || {
-            let found = update::check(&Version::current()).map_err(|e| debug_log(&format!("update check failed: {e}\n")));
+            let found = Self::check_source().map_err(|e| debug_log(&format!("update check failed: {e}\n")));
             post_update(&sh, hw, UpdateMsg::Checked(found));
         });
         if spawned.is_err() {
@@ -2126,6 +2126,19 @@ impl App {
             self.check_busy = false;
             self.arm_update_check(CHECK_EVERY_MS);
         }
+    }
+
+    /// The release check itself. Debug-only: `ISLE_TEST_LATEST_JSON=<file>` reads a saved `/releases/latest` response
+    /// instead of asking GitHub.
+    fn check_source() -> Result<Option<Release>, update::Error> {
+        if cfg!(debug_assertions) {
+            if let Some(p) = std::env::var_os("ISLE_TEST_LATEST_JSON") {
+                let json = std::fs::read_to_string(p).map_err(|e| update::Error::Io(e.to_string()))?;
+                let rel = update::parse_latest(&json)?;
+                return Ok(update::is_newer(&rel.version, &Version::current()).then_some(rel));
+            }
+        }
+        update::check(&Version::current())
     }
 
     /// The T_UPDATE one-shot fired.
@@ -3038,7 +3051,9 @@ pub fn run() -> windows::core::Result<()> {
             }
         }
         if a.update_on {
-            a.arm_update_check(CHECK_FIRST_MS);
+            // Debug-only `ISLE_TEST_UPDATE_DELAY=<ms>` shortens the first check.
+            let delay = std::env::var("ISLE_TEST_UPDATE_DELAY").ok().and_then(|v| v.parse().ok()).filter(|_| cfg!(debug_assertions));
+            a.arm_update_check(delay.unwrap_or(CHECK_FIRST_MS));
         }
         a.update_zone();
         a.sync_hook(false);
