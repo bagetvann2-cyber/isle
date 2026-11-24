@@ -1,8 +1,6 @@
 //! Alert detection (device connect / low battery / AC change / laptop low) and a small
 //! display queue. Pure state machines: every call takes `now` (ms, `GetTickCount64` base),
 //! nothing here reads a clock or runs a timer.
-// TODO(coder2): remove when wired
-#![allow(dead_code)]
 
 use crate::model::{Device, PartKind};
 use std::collections::{HashMap, HashSet};

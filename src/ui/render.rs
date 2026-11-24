@@ -16,6 +16,7 @@ use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPRO
 use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, UpdateLayeredWindowIndirect, ULW_ALPHA, UPDATELAYEREDWINDOWINFO};
 use windows_numerics::{Matrix3x2, Vector2};
 
+use super::banner::{self, Item};
 use super::layout::*;
 use super::liquid::{self, Edge, Shape};
 use crate::model::{Cover, DeviceKind, Part, PartKind};
@@ -69,6 +70,30 @@ pub struct Liquid {
     pub sh: Shape,
 }
 
+/// The one-line alert banner: `t` is its cross-fade weight against the normal compact row,
+/// `items` carry their x offset and width (from `banner::layout`), `total` the whole width.
+pub struct BannerDraw {
+    pub t: f32,
+    pub items: Vec<(Item, f32, f32)>,
+    pub total: f32,
+}
+
+/// The clock segment at the right end of the compact row: fixed-width digit cells,
+/// `w` the animated segment width (0 = gone), `full` its settled width.
+pub struct ClockDraw {
+    pub cells: Vec<(char, f32, f32)>,
+    pub total: f32,
+    pub w: f32,
+    pub full: f32,
+}
+
+/// Expanded view: which apps use the microphone / camera.
+pub struct PrivLine {
+    pub text: String,
+    pub mic: bool,
+    pub cam: bool,
+}
+
 pub struct Frame {
     pub s: f32,
     pub pill: Rect,
@@ -103,6 +128,11 @@ pub struct Frame {
     pub wave: Option<WaveDraw>,
     /// `Some` while the pill is on its way in or out of an edge (replaces `vis` / `vis_scale`).
     pub liquid: Option<Liquid>,
+    pub banner: Option<BannerDraw>,
+    pub clock: Option<ClockDraw>,
+    /// Microphone / camera in use: the dots on the cover's corner.
+    pub dots: (bool, bool),
+    pub priv_line: Option<PrivLine>,
 }
 
 /// Text layout reused until its string, format or box size changes.
@@ -165,6 +195,11 @@ pub struct Renderer {
     ico24: IDWriteTextFormat,
     ico20: IDWriteTextFormat,
     tiny: IDWriteTextFormat,
+    /// Clock digits: centred, so each one sits in the middle of its fixed cell.
+    clock_fmt: IDWriteTextFormat,
+    /// Widest digit and the colon, logical px: the clock's fixed cell widths.
+    digit_w: f32,
+    colon_w: f32,
     /// Circular skip arrow (forward orientation, radius 9, centred on the origin): open arc + filled head.
     skip_arc: ID2D1PathGeometry,
     skip_head: ID2D1PathGeometry,
@@ -353,7 +388,12 @@ impl Renderer {
                 f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
                 Ok(f)
             };
+            let clock_fmt = format(&dw, ui, 18.0, 500)?;
+            clock_fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             let mut r = Renderer {
+                clock_fmt,
+                digit_w: 12.0,
+                colon_w: 6.0,
                 pct: format(&dw, ui, 18.0, 500)?,
                 pct_trim,
                 title,
@@ -393,6 +433,8 @@ impl Renderer {
             };
             r.dc = CreateCompatibleDC(None);
             r.ph = r.cover_bmp(&placeholder_cover());
+            r.digit_w = "0123456789".chars().map(|c| r.measure(&c.to_string())).fold(0.0, f32::max).max(1.0) + 1.0;
+            r.colon_w = r.measure(":").max(1.0) + 1.0;
             r.make_dib(w_px, h_px)?;
             Ok(r)
         }
@@ -477,6 +519,16 @@ impl Renderer {
 
     pub fn measure(&self, s: &str) -> f32 {
         self.measure_with(s, &self.pct)
+    }
+
+    /// Banner text width: the 18 pt line, or the 13 pt one for the earbud figures.
+    pub fn measure_banner(&self, s: &str, small: bool) -> f32 {
+        self.measure_with(s, if small { &self.artist } else { &self.pct })
+    }
+
+    /// (digit cell, colon cell) of the clock label, logical px.
+    pub fn clock_metrics(&self) -> (f32, f32) {
+        (self.digit_w, self.colon_w)
     }
 
     fn measure_with(&self, s: &str, fmt: &IDWriteTextFormat) -> f32 {
@@ -742,10 +794,23 @@ impl Renderer {
     }
 
     /// Everything inside the pill, clipped to `clip` (window-logical px, under the current group).
-    fn content(&self, f: &Frame, g: &Geo, clip: Rect) {
+    fn content(&mut self, f: &Frame, g: &Geo, clip: Rect) {
         // SAFETY: balanced with the pop below.
         unsafe { self.rt.PushAxisAlignedClip(&rf(clip), D2D1_ANTIALIAS_MODE_ALIASED) };
-        self.row1(f, g);
+        match &f.banner {
+            Some(b) if b.t > 0.01 => {
+                // Cross-fade: the normal compact row out, the banner in.
+                let ga = self.ga;
+                if b.t < 0.99 {
+                    self.ga = ga * (1.0 - b.t);
+                    self.row1(f, g);
+                }
+                self.ga = ga * b.t;
+                self.banner(f, b);
+                self.ga = ga;
+            }
+            _ => self.row1(f, g),
+        }
         if f.content > 0.01 {
             self.block(f, g);
             self.parts_rows(f);
@@ -850,6 +915,39 @@ impl Renderer {
         }
     }
 
+    /// The banner items on the compact row, centred in the pill.
+    fn banner(&self, f: &Frame, b: &BannerDraw) {
+        let cy = f.row1 + PILL_H / 2.0;
+        let x0 = f.pill.l + ((f.pill.w() - b.total) / 2.0).max(PAD);
+        self.set_xf(None);
+        for (it, dx, w) in &b.items {
+            let x = x0 + dx;
+            match it {
+                Item::Glyph(ch, c) => self.glyph(&self.ico24, *ch, x + w / 2.0, cy, *c, 1.0),
+                Item::Bolt(c) => self.bolt(x + w / 2.0, cy, 1.0, 1.0, *c),
+                Item::Case => {
+                    let r = Rect::new(x, cy - 4.5, banner::CASE_W, 9.0);
+                    // SAFETY: valid pointers for the call.
+                    unsafe { self.rt.DrawRoundedRectangle(&rr(r, 2.5), self.color(banner::GREY, 1.0), 1.3, None) };
+                }
+                Item::Text { s, color, small } => {
+                    let fmt = if *small { &self.artist } else { &self.pct };
+                    self.text(s, fmt, Rect::new(x, cy - 14.0, w + 6.0, 28.0), *color, 1.0);
+                }
+            }
+        }
+    }
+
+    /// A filled dot with a black ring so it separates from whatever is behind it.
+    fn dot(&self, cx: f32, cy: f32, r: f32, hex: u32) {
+        let el = |rad: f32| D2D1_ELLIPSE { point: Vector2 { X: cx, Y: cy }, radiusX: rad, radiusY: rad };
+        // SAFETY: valid pointers for the call.
+        unsafe {
+            self.rt.FillEllipse(&el(r + 1.8), self.color(0x000000, 1.0));
+            self.rt.FillEllipse(&el(r), self.color(hex, 1.0));
+        }
+    }
+
     fn press_of(f: &Frame, c: Ctl) -> f32 {
         match f.press {
             Some((p, s)) if p == c => s,
@@ -877,6 +975,16 @@ impl Renderer {
                 }
             }
         }
+        // Privacy dots on the cover's top-right corner: microphone (orange), camera (green).
+        self.set_xf(None);
+        let mut dx = g.cover.r - 3.0;
+        if f.dots.0 {
+            self.dot(dx, g.cover.t + 3.0, 4.5, banner::ORANGE);
+            dx -= 13.0;
+        }
+        if f.dots.1 {
+            self.dot(dx, g.cover.t + 3.0, 4.5, banner::GREEN);
+        }
         // Play / pause.
         let pp = Self::press_of(f, Ctl::Play1);
         let a = if f.has_media { 1.0 } else { 0.30 };
@@ -888,11 +996,21 @@ impl Renderer {
         if let Some(w) = &f.wave {
             self.bars(f.pill.l, cy, w);
         }
+        // Clock segment at the right end: fixed-width digit cells, a divider on its left.
+        let clock_w = f.clock.as_ref().map_or(0.0, |c| c.w);
+        if let Some(c) = &f.clock {
+            let a = (c.w / c.full.max(1.0)).clamp(0.0, 1.0);
+            let left = f.pill.r - PAD - c.total;
+            for (ch, x, w) in &c.cells {
+                self.text(&ch.to_string(), &self.clock_fmt, Rect::new(left + x, cy - 14.0, *w, 28.0), banner::WHITE, a);
+            }
+            self.fill(Rect::around(left - 15.0, cy, 1.0, 36.0), 0.0, 0xFFFFFF, 0.10 * a);
+        }
         // Right section without devices: the current track (or the empty state).
         let dev_presence = f.devs.iter().map(|d| d.e).fold(0.0f32, f32::max);
         let ta = (1.0 - dev_presence).clamp(0.0, 1.0) * (1.0 - f.content).clamp(0.0, 1.0);
         if ta > 0.01 {
-            let (l, r) = (f.pill.l + f.text_l, f.pill.r - PAD);
+            let (l, r) = (f.pill.l + f.text_l, (f.pill.r - PAD - clock_w).max(f.pill.l + f.text_l + 40.0));
             if f.has_media {
                 let tr = Rect { l, t: cy - 21.0, r, b: cy + 1.0 };
                 let ar = Rect { l, t: cy + 1.0, r, b: cy + 19.0 };
@@ -910,7 +1028,7 @@ impl Renderer {
             return;
         }
         // Devices, right-anchored; item presence `e` drives both fade and slide.
-        let mut cursor = f.pill.r - PAD;
+        let mut cursor = f.pill.r - PAD - clock_w;
         let mut presence = 0.0f32;
         let mut last_e = 0.0;
         for d in f.devs.iter().rev() {
@@ -1026,15 +1144,31 @@ impl Renderer {
         if f.has_media {
             if f.text_t < 1.0 {
                 self.text(&f.prev_title, &self.title, off(g.title), 0xF2F2F2, c * (1.0 - f.text_t));
-                self.text(&f.prev_artist, &self.artist, off(g.artist), 0x8E8E93, c * (1.0 - f.text_t));
+                if f.priv_line.is_none() {
+                    self.text(&f.prev_artist, &self.artist, off(g.artist), 0x8E8E93, c * (1.0 - f.text_t));
+                }
             }
             self.text(&f.title, &self.title, off(g.title), 0xF2F2F2, c * f.text_t);
-            self.text(&f.artist, &self.artist, off(g.artist), 0x8E8E93, c * f.text_t);
+            if f.priv_line.is_none() {
+                self.text(&f.artist, &self.artist, off(g.artist), 0x8E8E93, c * f.text_t);
+            }
         } else {
             match &f.extra {
                 Some(e) => self.text(e, &self.artist, off(g.title), 0x8E8E93, c),
                 None => self.text(f.nothing, &self.title, off(g.title), 0x8E8E93, c),
             }
+        }
+        // The privacy line takes the artist line's place (there is no room for a third one).
+        if let Some(p) = &f.priv_line {
+            let r = off(g.artist);
+            let mut x = r.l;
+            for (on, hex) in [(p.mic, banner::ORANGE), (p.cam, banner::GREEN)] {
+                if on {
+                    self.fill(Rect::around(x + 3.5, (r.t + r.b) / 2.0, 7.0, 7.0), 3.5, hex, c);
+                    x += 11.0;
+                }
+            }
+            self.text(&p.text, &self.artist, Rect { l: x + 3.0, ..r }, banner::LIGHT, c);
         }
         if !f.has_media {
             return;
@@ -1249,7 +1383,7 @@ impl Drop for Renderer {
     }
 }
 
-fn icon_char(k: DeviceKind) -> char {
+pub fn icon_char(k: DeviceKind) -> char {
     match k {
         DeviceKind::Headphones | DeviceKind::Headset => '\u{E7F6}',
         DeviceKind::Mouse => '\u{E962}',

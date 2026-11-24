@@ -1,8 +1,6 @@
 //! Which apps are using the microphone / camera right now, from the per-user
 //! CapabilityAccessManager consent store. Event-driven: one thread parked in
 //! `WaitForMultipleObjects` on registry change notifications, zero polling.
-// TODO(coder2): remove when wired
-#![allow(dead_code)]
 
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{ERROR_SUCCESS, FILETIME, HANDLE, WAIT_OBJECT_0};

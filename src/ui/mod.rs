@@ -4,6 +4,7 @@
 //! Frames are paced by a helper thread that blocks in `DwmFlush` only while something
 //! animates; when everything has settled the thread parks on a channel and nothing runs.
 
+mod banner;
 pub mod layout;
 mod liquid;
 mod render;
@@ -18,12 +19,15 @@ use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Power::{
-    RegisterPowerSettingNotification, UnregisterPowerSettingNotification, HPOWERNOTIFY, POWERBROADCAST_SETTING,
+    GetSystemPowerStatus, RegisterPowerSettingNotification, UnregisterPowerSettingNotification, HPOWERNOTIFY, POWERBROADCAST_SETTING,
+    SYSTEM_POWER_STATUS,
 };
 use windows::Win32::System::RemoteDesktop::{WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION};
-use windows::Win32::System::SystemServices::GUID_SESSION_DISPLAY_STATUS;
+use windows::Win32::System::SystemInformation::GetTickCount64;
+use windows::Win32::System::SystemServices::{GUID_ACDC_POWER_SOURCE, GUID_BATTERY_PERCENTAGE_REMAINING, GUID_SESSION_DISPLAY_STATUS};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
@@ -33,15 +37,19 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::alerts::{Alert, Queue, Tracker};
 use crate::anim::{Spring, Tween};
 use crate::audio::Meter;
 use crate::battery::{BatteryHandle, LiveMode};
+use crate::clock::{self, Clock};
 use crate::media::MediaHandle;
 use crate::model::{Cover, Device, MediaCommand, MediaSnapshot, Part, PartKind};
+use crate::privacy::PrivacyState;
 use crate::settings;
+use banner::Item;
 use layout::*;
 use liquid::{choose_edge, edge_line, shape, Edge, IRect, RestBox};
-use render::{Ctl, DevDraw, Frame, Liquid, PartsRow, Renderer, WaveDraw};
+use render::{BannerDraw, ClockDraw, Ctl, DevDraw, Frame, Liquid, PartsRow, PrivLine, Renderer, WaveDraw};
 
 pub const WM_APP_MEDIA: u32 = WM_APP + 1;
 pub const WM_APP_DEVICES: u32 = WM_APP + 2;
@@ -53,6 +61,7 @@ static WM_TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 const WM_APP_FRAME: u32 = WM_APP + 3;
 const WM_APP_FOREGROUND: u32 = WM_APP + 4;
 const WM_APP_WAVE: u32 = WM_APP + 8;
+const WM_APP_PRIVACY: u32 = WM_APP + 9;
 
 /// Waveform pacing, shared with the `wave` helper thread: it posts `WM_APP_WAVE` every ~33 ms
 /// (`WAVE_FAST`, bars moving) or every 150 ms (`WAVE_POLL`, playing but silent) and parks on `WAVE_OFF`.
@@ -70,6 +79,18 @@ const T_HIDE: usize = 5;
 /// One-shot: saves the Ctrl+wheel size once the wheel has been quiet for `SIZE_SAVE_MS`.
 const T_SIZE: usize = 6;
 const SIZE_SAVE_MS: u32 = 500;
+/// One-shot: the banner has been up long enough.
+const T_ALERT: usize = 7;
+/// One-shot, re-armed on every second boundary while a clock runs on a visible island.
+const T_CLOCK_TICK: usize = 8;
+/// One-shot: the timer's deadline (armed whenever a timer runs, shown or not).
+const T_CLOCK_DUE: usize = 9;
+/// Debug-only: drives the scripted alert tests (`ISLE_TEST_FAKE_CONNECT`, `ISLE_TEST_POWER`).
+const T_TEST: usize = 10;
+/// How long a banner stays up.
+const ALERT_MS: u32 = 3000;
+/// Connect alerts are muted this long after resume / unlock (devices reappear then).
+const MUTE_MS: u64 = 15_000;
 
 /// Physical px per logical px: monitor DPI times the user's size setting.
 fn scale_for(dpi: u32, size_pct: u32) -> f32 {
@@ -130,6 +151,45 @@ impl Screen {
 pub struct Shared {
     pub media: Mutex<Option<MediaSnapshot>>,
     pub devices: Mutex<Vec<Device>>,
+    pub privacy: Mutex<PrivacyState>,
+}
+
+/// `GetTickCount64`, the time base of `alerts` and `clock`.
+fn now_ms() -> u64 {
+    // SAFETY: plain query.
+    unsafe { GetTickCount64() }
+}
+
+/// The one place that decides whether the island is on screen: always-visible, hover (cursor near,
+/// menu or drag) or an alert banner, and never while a fullscreen app hides it.
+fn want_shown(fs_hidden: bool, always: bool, hover: bool, alert: bool) -> bool {
+    !fs_hidden && (always || hover || alert)
+}
+
+/// `GetSystemPowerStatus` fields to `(on AC, percent)`; `None` without a usable system battery
+/// (desktop PC: flag 128 / 255) or with unknown values.
+fn power_sample(ac_line: u8, battery_flag: u8, percent: u8) -> Option<(bool, u8)> {
+    if battery_flag == 255 || battery_flag & 128 != 0 || percent > 100 {
+        return None;
+    }
+    match ac_line {
+        0 => Some((false, percent)),
+        1 => Some((true, percent)),
+        _ => None,
+    }
+}
+
+/// The banner on (or leaving) the compact row.
+struct ActiveBanner {
+    alert: Alert,
+    items: Vec<Item>,
+    /// (x, width) per item, and the total width, logical px.
+    xs: Vec<(f32, f32)>,
+    total: f32,
+    /// Stays until clicked (the timer); the others go after `ALERT_MS`.
+    sticky: bool,
+    /// False while it fades out.
+    live: bool,
 }
 
 static APP: AtomicPtr<App> = AtomicPtr::new(std::ptr::null_mut());
@@ -147,6 +207,8 @@ const SEEK_STEP_MS: i64 = 10_000;
 enum Hit {
     Outside,
     Pill,
+    /// The clock segment (expanded only): a click stops the clock.
+    Clock,
     Ctl(Ctl),
     /// The progress bar's seek strip (expanded, seekable only).
     Bar,
@@ -277,6 +339,33 @@ struct App {
     prev_artist: String,
     prev_cover: Option<Arc<Cover>>,
     devs: Vec<DevView>,
+
+    // alerts
+    tracker: Tracker,
+    queue: Queue,
+    alerts_on: bool,
+    banner: Option<ActiveBanner>,
+    /// Cross-fade between the normal compact row (0) and the banner (1).
+    banner_t: Tween,
+    /// A banner is up: part of the visibility predicate.
+    alert_active: bool,
+    /// The banner's time is up but the cursor is over the island: dismiss once it leaves.
+    alert_hold: bool,
+    timer_total_ms: u64,
+    timer_sound: bool,
+    power_notify: [isize; 2],
+    test_n: u32,
+    fake_connect: bool,
+
+    // clock and privacy
+    clock: Clock,
+    /// Width of the clock segment (logical px), springing between 0 and `clk_full`.
+    clk: Spring,
+    clk_full: f32,
+    /// Label shown while the segment fades out after a stop.
+    clk_last: String,
+    clk_tick: bool,
+    privacy: PrivacyState,
 }
 
 fn work_area(x: i32, y: i32, primary: bool) -> (RECT, u32) {
@@ -372,6 +461,24 @@ impl App {
             prev_artist: String::new(),
             prev_cover: None,
             devs: Vec::new(),
+            tracker: Tracker::new(),
+            queue: Queue::default(),
+            alerts_on: settings::alerts(),
+            banner: None,
+            banner_t: Tween::at(0.0, now),
+            alert_active: false,
+            alert_hold: false,
+            timer_total_ms: 0,
+            timer_sound: false,
+            power_notify: [0; 2],
+            test_n: 0,
+            fake_connect: false,
+            clock: Clock::Off,
+            clk: Spring::new(0.0, 0.40, 0.90),
+            clk_full: 0.0,
+            clk_last: String::new(),
+            clk_tick: false,
+            privacy: PrivacyState::default(),
         };
         a.scale = scale_for(dpi, a.size_pct);
         a.recompute_size();
@@ -484,6 +591,8 @@ impl App {
             || !self.text_t.done(now)
             || !self.cover_t.done(now)
             || !self.pp_t.done(now)
+            || !self.banner_t.done(now)
+            || !self.clk.settled(0.5, 2.0)
             || self.devs.iter().any(|d| !d.pres.done(now) || !d.pct_t.done(now) || !d.chg_t.done(now))
     }
 
@@ -492,6 +601,7 @@ impl App {
         self.last_tick = now;
         self.open.step(dt);
         self.width.step(dt);
+        self.clk.step(dt);
         self.vis.step(dt);
         self.q.step(dt);
         self.press.step(dt);
@@ -508,6 +618,12 @@ impl App {
         }
         if self.width.settled(0.5, 2.0) {
             self.width.snap();
+        }
+        if self.clk.settled(0.5, 2.0) {
+            self.clk.snap();
+        }
+        if self.banner.as_ref().is_some_and(|b| !b.live) && self.banner_t.done(now) {
+            self.banner = None;
         }
         if self.vis_settled() {
             self.vis.snap();
@@ -585,6 +701,7 @@ impl App {
         self.sync_wave();
         self.sync_live();
         self.sync_progress_timer();
+        self.sync_alerts();
         if self.screen.active() {
             self.kick();
         }
@@ -835,7 +952,36 @@ impl App {
             text_l: text_l(self.wave_on && self.media.is_some()),
             wave: self.wave_draw(now),
             liquid: self.liquid_frame(pill, radius),
+            banner: self.banner_draw(now),
+            clock: self.clock_draw(),
+            dots: (!self.privacy.mic.is_empty(), !self.privacy.cam.is_empty()),
+            priv_line: banner::privacy_line(&self.privacy, self.ru).map(|text| PrivLine {
+                text,
+                mic: !self.privacy.mic.is_empty(),
+                cam: !self.privacy.cam.is_empty(),
+            }),
         }
+    }
+
+    fn banner_draw(&self, now: Instant) -> Option<BannerDraw> {
+        let b = self.banner.as_ref()?;
+        let t = self.banner_t.val(now);
+        (t > 0.001).then(|| BannerDraw {
+            t,
+            items: b.items.iter().zip(&b.xs).map(|(i, &(x, w))| (i.clone(), x, w)).collect(),
+            total: b.total,
+        })
+    }
+
+    fn clock_draw(&self) -> Option<ClockDraw> {
+        let running = self.clock != Clock::Off;
+        if !running && self.clk.x < 0.5 {
+            return None;
+        }
+        let label = if running { clock::label(&self.clock, now_ms()) } else { self.clk_last.clone() };
+        let (d, c) = self.r.as_ref().map_or((12.0, 6.0), |r| r.clock_metrics());
+        let (cells, total) = banner::clock_cells(&label, d, c);
+        Some(ClockDraw { cells, total, w: self.clk.x.max(0.0), full: self.clk_full })
     }
 
     /// Devices that take a slot on the pill: the first three live ones plus any fading out.
@@ -912,17 +1058,23 @@ bar {} {} {}
         }
         let s = self.scale;
         let (x, y) = ((px - self.win_x) as f32 / s, (py - self.win_y()) as f32 / s);
-        let (pill, radius, g, _, _) = self.geometry();
+        let (pill, radius, g, row1, _) = self.geometry();
         if !in_pill(pill, radius, x, y) {
             return Hit::Outside;
         }
         let near = |p: (f32, f32)| Rect::around(p.0, p.1, 32.0, 32.0).contains(x, y);
         let seekable = self.media.as_ref().is_some_and(|m| m.can_seek && m.duration_ms > 0);
-        if g.cover.contains(x, y) {
+        // While a banner covers the compact row its controls are not there: a click on it only dismisses.
+        let banner = self.banner_live();
+        let expanded = self.content.target() == 1.0 && self.open.x > 0.9;
+        let clock = Rect { l: pill.r - PAD - self.clk.x, t: row1, r: pill.r, b: row1 + PILL_H };
+        if !banner && g.cover.contains(x, y) {
             Hit::Ctl(Ctl::Cover)
-        } else if near(g.pp1) {
+        } else if !banner && near(g.pp1) {
             Hit::Ctl(Ctl::Play1)
-        } else if self.content.target() == 1.0 && self.open.x > 0.9 {
+        } else if expanded && !banner && self.clock != Clock::Off && clock.contains(x, y) {
+            Hit::Clock
+        } else if expanded {
             if seekable && near(g.back) {
                 Hit::Ctl(Ctl::Back)
             } else if seekable && near(g.fwd) {
@@ -1021,6 +1173,7 @@ bar {} {} {}
                 }
             }
         }
+        self.sync_clock_tick(false);
     }
 
     fn cursor_in_pill(&self) -> bool {
@@ -1128,6 +1281,17 @@ bar {} {} {}
             if self.hit_at(p.x, p.y) == d.hit {
                 self.command(c);
             }
+        } else if d.hit == Hit::Clock {
+            let mut p = POINT::default();
+            // SAFETY: valid out pointer.
+            unsafe {
+                let _ = GetCursorPos(&mut p);
+            }
+            if self.hit_at(p.x, p.y) == Hit::Clock {
+                self.stop_clock();
+            }
+        } else if d.hit == Hit::Pill && self.banner_live() {
+            self.finish_alert();
         } else if d.hit == Hit::Bar {
             let mut p = POINT::default();
             // SAFETY: valid out pointer.
@@ -1244,6 +1408,21 @@ bar {} {} {}
                 },
             ];
         }
+        if self.fake_connect {
+            // debug-only (ISLE_TEST_FAKE_CONNECT): earbuds that "connect" a few seconds after start
+            new.push(Device {
+                id: "fake-connect".into(),
+                name: "Redmi Buds 6".into(),
+                kind: crate::model::DeviceKind::Headset,
+                percent: 85,
+                charging: None,
+                parts: vec![
+                    Part { kind: PartKind::Left, percent: 85, charging: false },
+                    Part { kind: PartKind::Right, percent: 12, charging: false },
+                    Part { kind: PartKind::Case, percent: 60, charging: false },
+                ],
+            });
+        }
         if test_knob("ISLE_FAKE_GAMEPAD") {
             // debug-only: a charging gamepad
             new.push(Device {
@@ -1270,6 +1449,7 @@ bar {} {} {}
                 ],
             });
         }
+        let found = self.tracker.on_devices(now_ms(), &new);
         let old = std::mem::take(&mut self.devs);
         let mut out: Vec<DevView> = Vec::with_capacity(new.len());
         for d in new {
@@ -1334,6 +1514,7 @@ bar {} {} {}
             self.rows_t.go(rows, 0.25, now);
         }
         self.update_zone();
+        self.push_alerts(found);
         if self.shown {
             self.kick();
         }
@@ -1341,7 +1522,12 @@ bar {} {} {}
 
     fn update_width_target(&mut self) {
         let items: Vec<f32> = self.shown_devs().filter(|d| !d.removing).map(|d| d.full_w()).collect();
-        self.width.target = target_width(&items, self.wave_on);
+        let clock = if self.clock == Clock::Off { 0.0 } else { self.clk_full };
+        let base = target_width(&items, self.wave_on, clock);
+        self.width.target = match self.banner.as_ref().filter(|b| b.live) {
+            Some(b) => banner::pill_width(base, b.total, MAX_W),
+            None => base,
+        };
         self.width.tune(0.40, 0.80);
     }
 
@@ -1439,11 +1625,13 @@ bar {} {} {}
         }
         self.fs_hidden = hide;
         self.sync_hook(!hide);
+        self.sync_alerts();
         self.apply_visibility();
     }
 
     fn apply_visibility(&mut self) {
-        let want = !self.fs_hidden && (self.always_visible || self.zone_active || self.menu_open || self.drag.is_some());
+        let hover = self.zone_active || self.menu_open || self.drag.is_some();
+        let want = want_shown(self.fs_hidden, self.always_visible, hover, self.alert_active);
         self.set_vis(want);
         if want && !self.shown {
             self.shown = true;
@@ -1455,6 +1643,7 @@ bar {} {} {}
         }
         self.sync_wave();
         self.sync_live();
+        self.sync_clock_tick(false);
         self.kick();
     }
 
@@ -1605,6 +1794,367 @@ bar {} {} {}
         self.place_default(&work);
         self.clamp_to_monitor();
         self.paint();
+    }
+}
+
+// ---- alerts, clock, privacy ----
+
+/// What a menu command does to the clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClockCmd {
+    Timer(u64),
+    Stopwatch,
+    Stop,
+}
+
+/// Menu command ids of the timer submenu: `CLOCK_CMD + minutes`, then the two fixed ones.
+const CLOCK_CMD: usize = 400;
+const CLOCK_MINUTES: [u64; 6] = [1, 5, 10, 15, 25, 60];
+const CLOCK_STOPWATCH: usize = 480;
+const CLOCK_STOP: usize = 481;
+/// Menu id of the notifications toggle.
+const ALERTS_CMD: usize = 6;
+
+fn clock_cmd(id: usize) -> Option<ClockCmd> {
+    match id {
+        CLOCK_STOPWATCH => Some(ClockCmd::Stopwatch),
+        CLOCK_STOP => Some(ClockCmd::Stop),
+        _ => CLOCK_MINUTES.iter().find(|&&m| CLOCK_CMD + m as usize == id).map(|&m| ClockCmd::Timer(m)),
+    }
+}
+
+/// The system notification sound, once. Debug perf runs log whether the call went through.
+fn play_notification() {
+    // SAFETY: plays a registered sound alias asynchronously; no buffers are involved.
+    let ok = unsafe { PlaySoundW(w!("SystemNotification"), None, SND_ALIAS | SND_ASYNC) };
+    if test_knob("ISLE_PERF") {
+        perf_log(&format!("notification sound: {}\n", ok.as_bool()));
+    }
+}
+
+impl App {
+    fn banner_live(&self) -> bool {
+        self.banner.as_ref().is_some_and(|b| b.live)
+    }
+
+    /// Banners may be on screen: enabled, the screen is lit and unlocked, no fullscreen app in front.
+    fn can_alert(&self) -> bool {
+        self.alerts_on && self.screen.active() && !self.fs_hidden
+    }
+
+    /// Queue what the tracker found (unless alerts are off) and bring the banner up to date.
+    fn push_alerts(&mut self, found: Vec<Alert>) {
+        if found.is_empty() {
+            return;
+        }
+        if self.alerts_on {
+            let now = now_ms();
+            for a in found {
+                self.queue.push(a, now);
+            }
+        }
+        self.sync_alerts();
+    }
+
+    /// Make the banner match the queue: show the head when allowed, take the banner down when not.
+    fn sync_alerts(&mut self) {
+        if !self.alerts_on {
+            self.queue = Queue::default();
+        }
+        let can = self.can_alert();
+        let head = self.queue.current(now_ms(), can).cloned();
+        let changed = match head {
+            Some(a) if self.banner.as_ref().is_some_and(|b| b.live && b.alert == a) => false,
+            Some(a) => {
+                if !self.show_banner(a) {
+                    // Nothing to show for it (its device is gone): drop it and look at the next one.
+                    self.queue.dismiss();
+                    self.sync_alerts();
+                }
+                true
+            }
+            None if self.banner_live() => {
+                self.banner_off();
+                true
+            }
+            None => false,
+        };
+        if changed {
+            self.update_width_target();
+            self.update_zone();
+            self.apply_visibility();
+        }
+    }
+
+    /// Put `a` on the compact row. False when it cannot be shown (a device alert whose device left).
+    fn show_banner(&mut self, a: Alert) -> bool {
+        let dev = match &a {
+            Alert::DeviceConnected { id } | Alert::DeviceLow { id, .. } => {
+                self.devs.iter().find(|d| &d.dev.id == id && !d.removing).map(|d| &d.dev)
+            }
+            _ => None,
+        };
+        let items = banner::banner_items(&a, dev, self.timer_total_ms, self.ru);
+        if items.is_empty() {
+            return false;
+        }
+        let r = self.r.as_ref();
+        let (xs, total) = banner::layout(&items, |it| match it {
+            Item::Glyph(..) => ICON_W,
+            Item::Bolt(_) => BOLT_GLYPH_W,
+            Item::Case => banner::CASE_W,
+            Item::Text { s, small, .. } => r.map_or(s.chars().count() as f32 * 9.0, |r| r.measure_banner(s, *small)),
+        });
+        let sticky = a == Alert::TimerDone;
+        if sticky && !self.timer_sound {
+            self.timer_sound = true;
+            play_notification();
+        }
+        self.banner = Some(ActiveBanner { alert: a, items, xs, total, sticky, live: true });
+        self.banner_t.go(1.0, 0.22, Instant::now());
+        self.alert_hold = false;
+        self.alert_active = true;
+        // SAFETY: timers on our own window.
+        unsafe {
+            if sticky {
+                let _ = KillTimer(Some(self.hwnd), T_ALERT);
+            } else {
+                SetTimer(Some(self.hwnd), T_ALERT, ALERT_MS, None);
+            }
+        }
+        self.kick();
+        true
+    }
+
+    /// Fade the banner out; the queue is left alone (it comes back if it was only held off).
+    fn banner_off(&mut self) {
+        if let Some(b) = &mut self.banner {
+            b.live = false;
+        }
+        self.banner_t.go(0.0, 0.20, Instant::now());
+        self.alert_active = false;
+        self.alert_hold = false;
+        // SAFETY: timer on our own window.
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), T_ALERT);
+        }
+        self.kick();
+    }
+
+    /// The banner is done (time up, or clicked): drop it from the queue and show the next one.
+    fn finish_alert(&mut self) {
+        if self.banner.as_ref().is_some_and(|b| b.live && b.sticky) {
+            self.timer_sound = false;
+        }
+        self.queue.dismiss();
+        self.banner_off();
+        self.sync_alerts();
+        self.update_width_target();
+        self.update_zone();
+        self.apply_visibility();
+    }
+
+    fn on_alert_timer(&mut self) {
+        // SAFETY: timer on our own window.
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), T_ALERT);
+        }
+        if self.banner.as_ref().is_some_and(|b| b.live && !b.sticky) {
+            if self.cursor_in_pill() {
+                // Dismissed when the cursor leaves (WM_MOUSELEAVE); the 1 s re-check, which only
+                // runs while a hovered banner is up, covers a leave that was never tracked.
+                self.alert_hold = true;
+                // SAFETY: timer on our own window.
+                unsafe {
+                    SetTimer(Some(self.hwnd), T_ALERT, 1000, None);
+                }
+            } else {
+                self.finish_alert();
+            }
+        }
+    }
+
+    /// AC / battery level changed (power-setting notification): read the status and feed the tracker.
+    fn on_power_event(&mut self) {
+        let mut st = SYSTEM_POWER_STATUS::default();
+        // SAFETY: valid out pointer.
+        if unsafe { GetSystemPowerStatus(&mut st) }.is_err() {
+            return;
+        }
+        if let Some((ac, pct)) = power_sample(st.ACLineStatus, st.BatteryFlag, st.BatteryLifePercent) {
+            self.feed_power(ac, pct);
+        }
+    }
+
+    fn feed_power(&mut self, ac: bool, pct: u8) {
+        let found = self.tracker.on_power(now_ms(), ac, pct);
+        self.push_alerts(found);
+    }
+
+    /// Microphone / camera users changed (the watcher thread posted it).
+    fn on_privacy(&mut self) {
+        let new = self.shared.privacy.lock().map(|g| g.clone()).unwrap_or_default();
+        if new == self.privacy {
+            return;
+        }
+        self.privacy = new;
+        if self.shown {
+            if self.is_animating(Instant::now()) {
+                self.kick();
+            } else {
+                self.paint();
+            }
+        }
+    }
+
+    // ---- clock ----
+
+    fn clock_seg_w(&self) -> f32 {
+        let label = clock::label(&self.clock, now_ms());
+        let (d, c) = self.r.as_ref().map_or((12.0, 6.0), |r| r.clock_metrics());
+        banner::clock_seg_w(banner::clock_cells(&label, d, c).1)
+    }
+
+    /// Start (or replace) the clock.
+    fn start_clock(&mut self, c: Clock) {
+        self.clock = c;
+        self.clk_full = self.clock_seg_w();
+        self.clk.target = self.clk_full;
+        self.clk.tune(0.40, 0.90);
+        // SAFETY: timer on our own window.
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), T_CLOCK_DUE);
+        }
+        self.clock_check();
+        self.update_width_target();
+        self.update_zone();
+        self.sync_clock_tick(true);
+        self.kick();
+    }
+
+    fn stop_clock(&mut self) {
+        if self.clock == Clock::Off {
+            return;
+        }
+        self.clk_last = clock::label(&self.clock, now_ms());
+        self.clock = Clock::Off;
+        self.clk.target = 0.0;
+        // SAFETY: timer on our own window.
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), T_CLOCK_DUE);
+        }
+        self.sync_clock_tick(false);
+        self.update_width_target();
+        self.update_zone();
+        self.kick();
+    }
+
+    /// Fire an expired timer now, or arm the one-shot for what is left. Also the recompute after sleep.
+    fn clock_check(&mut self) {
+        match clock::remaining_ms(&self.clock, now_ms()) {
+            Some(0) => self.fire_timer(),
+            Some(left) => {
+                // SAFETY: one-shot timer on our own window.
+                unsafe {
+                    SetTimer(Some(self.hwnd), T_CLOCK_DUE, left.min(u32::MAX as u64 - 1) as u32, None);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn fire_timer(&mut self) {
+        if let Clock::Timer { total_ms, .. } = self.clock {
+            self.timer_total_ms = total_ms;
+        }
+        self.stop_clock();
+        if self.alerts_on {
+            self.queue.push(Alert::TimerDone, now_ms());
+            // A second timer finishing while the first banner is still up: rebuild it (new total, sound).
+            if self.banner.as_ref().is_some_and(|b| b.alert == Alert::TimerDone) {
+                self.timer_sound = false;
+                self.banner = None;
+            }
+        }
+        self.sync_alerts();
+    }
+
+    fn on_clock_due(&mut self) {
+        // SAFETY: timer on our own window.
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), T_CLOCK_DUE);
+        }
+        self.clock_check();
+    }
+
+    /// Second boundary: repaint the label and re-arm for the next one.
+    fn on_clock_tick(&mut self) {
+        // SetTimer repeats until killed: make this a real one-shot (sync_clock_tick re-arms it).
+        // SAFETY: timer on our own window.
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), T_CLOCK_TICK);
+        }
+        self.clk_tick = false;
+        if clock::expired(&self.clock, now_ms()) {
+            self.clock_check();
+            return;
+        }
+        // The label may have grown (1:00:00) or shrunk: keep the segment as wide as it needs.
+        let w = self.clock_seg_w();
+        if self.clock != Clock::Off && (w - self.clk_full).abs() > 0.5 {
+            self.clk_full = w;
+            self.clk.target = w;
+            self.update_width_target();
+            self.update_zone();
+            self.kick();
+        }
+        self.paint();
+        self.sync_clock_tick(true);
+    }
+
+    /// The 1 s tick runs only while a clock runs, the island is shown and the screen is lit.
+    fn sync_clock_tick(&mut self, rearm: bool) {
+        let want = self.clock != Clock::Off && self.on_screen();
+        // SAFETY: timer on our own window.
+        unsafe {
+            if want && (rearm || !self.clk_tick) {
+                let ms = clock::next_tick_ms(&self.clock, now_ms()).clamp(10, 1000);
+                SetTimer(Some(self.hwnd), T_CLOCK_TICK, ms as u32, None);
+                self.clk_tick = true;
+            } else if !want {
+                let _ = KillTimer(Some(self.hwnd), T_CLOCK_TICK);
+                self.clk_tick = false;
+            }
+        }
+    }
+
+    /// Debug-only scripted steps behind `ISLE_TEST_FAKE_CONNECT` / `ISLE_TEST_POWER`.
+    fn on_test_step(&mut self) {
+        // SAFETY: timer on our own window.
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), T_TEST);
+        }
+        let n = self.test_n;
+        self.test_n += 1;
+        let mut more = false;
+        if test_knob("ISLE_TEST_FAKE_CONNECT") {
+            self.fake_connect = n == 0;
+            self.on_devices();
+            more = n == 0;
+        }
+        if test_knob("ISLE_TEST_POWER") {
+            let steps = [(false, 76), (true, 76), (false, 76), (false, 19)];
+            if let Some(&(ac, pct)) = steps.get(n as usize) {
+                self.feed_power(ac, pct);
+                more = n as usize + 1 < steps.len();
+            }
+        }
+        if more {
+            // SAFETY: timer on our own window.
+            unsafe {
+                SetTimer(Some(self.hwnd), T_TEST, 6000, None);
+            }
+        }
     }
 }
 
@@ -1764,6 +2314,7 @@ const SIZE_CMD: usize = 100;
 
 unsafe fn show_menu(hwnd: HWND) {
     let ru = app().ru;
+    let tr = |ru_s: &str, en_s: &str| wide0(if ru { ru_s } else { en_s });
     let (t_auto, t_reset, t_exit, t_vis, t_wave, t_size) = if ru {
         ("Запускать вместе с Windows", "Сбросить позицию", "Выход", "Всегда показывать", "Показывать волну", "Размер")
     } else {
@@ -1777,6 +2328,21 @@ unsafe fn show_menu(hwnd: HWND) {
     let _ = AppendMenuW(menu, vflags, 4, PCWSTR(d.as_ptr()));
     let wflags = if app().wave_on { MF_STRING | MF_CHECKED } else { MF_STRING };
     let _ = AppendMenuW(menu, wflags, 5, PCWSTR(e.as_ptr()));
+    let t_notif = tr("Уведомления", "Notifications");
+    let nflags = if app().alerts_on { MF_STRING | MF_CHECKED } else { MF_STRING };
+    let _ = AppendMenuW(menu, nflags, ALERTS_CMD, PCWSTR(t_notif.as_ptr()));
+    let (t_timer, t_sw, t_stop) = (tr("Таймер", "Timer"), tr("Секундомер", "Stopwatch"), tr("Остановить", "Stop"));
+    let mins: Vec<Vec<u16>> = CLOCK_MINUTES.iter().map(|m| wide0(&if ru { format!("{m} мин") } else { format!("{m} min") })).collect();
+    if let Ok(sub) = CreatePopupMenu() {
+        for (m, l) in CLOCK_MINUTES.iter().zip(&mins) {
+            let _ = AppendMenuW(sub, MF_STRING, CLOCK_CMD + *m as usize, PCWSTR(l.as_ptr()));
+        }
+        let _ = AppendMenuW(sub, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(sub, MF_STRING, CLOCK_STOPWATCH, PCWSTR(t_sw.as_ptr()));
+        let stop = if app().clock == Clock::Off { MF_STRING | MF_GRAYED } else { MF_STRING };
+        let _ = AppendMenuW(sub, stop, CLOCK_STOP, PCWSTR(t_stop.as_ptr()));
+        let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(t_timer.as_ptr()));
+    }
     let labels: Vec<Vec<u16>> = SIZE_PRESETS.iter().map(|p| wide0(&format!("{p} %"))).collect();
     let t_size = wide0(t_size);
     if let Ok(sub) = CreatePopupMenu() {
@@ -1820,6 +2386,23 @@ unsafe fn show_menu(hwnd: HWND) {
             a.update_zone();
             a.sync_wave();
             a.kick();
+        }
+        c if c as usize == ALERTS_CMD => {
+            a.alerts_on = !a.alerts_on;
+            settings::set_alerts(a.alerts_on);
+            if !a.alerts_on {
+                a.timer_sound = false;
+            }
+            a.sync_alerts();
+        }
+        c if clock_cmd(c as usize).is_some() => {
+            let now = now_ms();
+            match clock_cmd(c as usize) {
+                Some(ClockCmd::Timer(m)) => a.start_clock(Clock::Timer { deadline_ms: now + m * 60_000, total_ms: m * 60_000 }),
+                Some(ClockCmd::Stopwatch) => a.start_clock(Clock::Stopwatch { start_ms: now }),
+                Some(ClockCmd::Stop) => a.stop_clock(),
+                None => {}
+            }
         }
         3 => {
             let _ = DestroyWindow(hwnd);
@@ -1893,12 +2476,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let a = app();
             match wp.0 {
                 T_SIZE => a.save_size(),
+                T_ALERT => a.on_alert_timer(),
+                T_CLOCK_TICK => a.on_clock_tick(),
+                T_CLOCK_DUE => a.on_clock_due(),
+                T_TEST => a.on_test_step(),
                 T_PROGRESS => a.paint(),
                 T_LEAVE => {
                     let _ = KillTimer(Some(hwnd), T_LEAVE);
                     a.leave_pending = false;
                     if !a.menu_open && a.drag.is_none() && !a.cursor_in_pill() {
                         a.request_collapse(Instant::now());
+                        if a.alert_hold {
+                            a.finish_alert();
+                        }
                     }
                 }
                 T_HIDE => {
@@ -1932,6 +2522,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_APP_DEVICES => {
             app().on_devices();
+            LRESULT(0)
+        }
+        WM_APP_PRIVACY => {
+            app().on_privacy();
             LRESULT(0)
         }
         WM_APP_ZONE => {
@@ -1972,17 +2566,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_POWERBROADCAST => {
             if wp.0 == PBT_APMRESUMEAUTOMATIC {
-                if let Some(b) = &app().battery {
+                let a = app();
+                a.tracker.mute_until(now_ms() + MUTE_MS);
+                if let Some(b) = &a.battery {
                     b.refresh();
                 }
+                // The timer's one-shot does not count sleep: recompute (and fire if it ran out meanwhile).
+                a.clock_check();
             } else if wp.0 == PBT_POWERSETTINGCHANGE as usize && lp.0 != 0 {
                 // SAFETY: for this event lParam points to a POWERBROADCAST_SETTING for the call's duration.
                 let p = lp.0 as *const POWERBROADCAST_SETTING;
-                if (*p).PowerSetting == GUID_SESSION_DISPLAY_STATUS && (*p).DataLength as usize >= 4 {
+                let setting = (*p).PowerSetting;
+                if setting == GUID_SESSION_DISPLAY_STATUS && (*p).DataLength as usize >= 4 {
                     let a = app();
                     let was = a.screen.active();
                     a.screen.set_display(std::ptr::addr_of!((*p).Data).cast::<u32>().read_unaligned());
                     a.on_screen_change(was);
+                } else if setting == GUID_ACDC_POWER_SOURCE || setting == GUID_BATTERY_PERCENTAGE_REMAINING {
+                    app().on_power_event();
                 }
             }
             LRESULT(1)
@@ -1990,15 +2591,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_WTSSESSION_CHANGE => {
             let a = app();
             let was = a.screen.active();
+            if wp.0 as u32 == WTS_SESSION_UNLOCK {
+                a.tracker.mute_until(now_ms() + MUTE_MS);
+            }
             a.screen.session_event(wp.0 as u32);
             a.on_screen_change(was);
             LRESULT(0)
         }
         WM_DESTROY => {
             let _ = WTSUnRegisterSessionNotification(hwnd);
-            let n = std::mem::take(&mut app().screen_notify);
-            if n != 0 {
-                let _ = UnregisterPowerSettingNotification(HPOWERNOTIFY(n));
+            let a = app();
+            let power = std::mem::take(&mut a.power_notify);
+            for n in std::iter::once(std::mem::take(&mut a.screen_notify)).chain(power) {
+                if n != 0 {
+                    let _ = UnregisterPowerSettingNotification(HPOWERNOTIFY(n));
+                }
             }
             app().tray_remove();
             PostQuitMessage(0);
@@ -2083,7 +2690,7 @@ pub fn run() -> windows::core::Result<()> {
             }
             let _ = PostMessageW(Some(HWND(hw as *mut _)), WM_APP_DEVICES, WPARAM(0), LPARAM(0));
         })));
-        a0.media_tx = Some(crate::media::spawn(hw, shared));
+        a0.media_tx = Some(crate::media::spawn(hw, shared.clone()));
         APP.store(Box::into_raw(a0), Ordering::Release);
 
         // First (transparent) frame, then show and animate in.
@@ -2094,6 +2701,30 @@ pub fn run() -> windows::core::Result<()> {
         let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
         if let Ok(n) = RegisterPowerSettingNotification(HANDLE(hwnd.0), &GUID_SESSION_DISPLAY_STATUS, DEVICE_NOTIFY_WINDOW_HANDLE) {
             a.screen_notify = n.0;
+        }
+        // AC source and battery level: the first values Windows sends right after registering are the tracker's baseline.
+        for (slot, guid) in a.power_notify.iter_mut().zip([&GUID_ACDC_POWER_SOURCE, &GUID_BATTERY_PERCENTAGE_REMAINING]) {
+            if let Ok(n) = RegisterPowerSettingNotification(HANDLE(hwnd.0), guid, DEVICE_NOTIFY_WINDOW_HANDLE) {
+                *slot = n.0;
+            }
+        }
+        let sh = shared.clone();
+        crate::privacy::spawn(move |state| {
+            if let Ok(mut g) = sh.privacy.lock() {
+                *g = state;
+            }
+            let _ = PostMessageW(Some(HWND(hw as *mut _)), WM_APP_PRIVACY, WPARAM(0), LPARAM(0));
+        });
+        if cfg!(debug_assertions) {
+            if let Some(secs) = std::env::var("ISLE_TEST_TIMER").ok().and_then(|v| v.parse::<u64>().ok()) {
+                a.start_clock(Clock::Timer { deadline_ms: now_ms() + secs * 1000, total_ms: secs * 1000 });
+            }
+            if test_knob("ISLE_TEST_STOPWATCH") {
+                a.start_clock(Clock::Stopwatch { start_ms: now_ms() });
+            }
+            if test_knob("ISLE_TEST_FAKE_CONNECT") || test_knob("ISLE_TEST_POWER") {
+                SetTimer(Some(hwnd), T_TEST, 4000, None);
+            }
         }
         a.update_zone();
         a.sync_hook(false);
@@ -2121,6 +2752,42 @@ pub fn run() -> windows::core::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visibility_predicate() {
+        // Hover, always-visible and an alert each show it; nothing shows nothing.
+        assert!(!want_shown(false, false, false, false));
+        assert!(want_shown(false, true, false, false));
+        assert!(want_shown(false, false, true, false));
+        assert!(want_shown(false, false, false, true), "an alert reveals a hidden island");
+        // A fullscreen app overrides every reason, alerts included.
+        assert!(!want_shown(true, true, true, true));
+    }
+
+    #[test]
+    fn power_samples() {
+        assert_eq!(power_sample(1, 8, 76), Some((true, 76))); // charging
+        assert_eq!(power_sample(0, 0, 40), Some((false, 40)));
+        assert_eq!(power_sample(0, 128, 0), None); // no system battery (desktop)
+        assert_eq!(power_sample(1, 255, 100), None); // unknown status
+        assert_eq!(power_sample(1, 1, 255), None); // unknown percent
+        assert_eq!(power_sample(255, 1, 50), None); // unknown AC state
+        assert_eq!(power_sample(1, 9 | 128, 50), None);
+    }
+
+    #[test]
+    fn clock_menu_commands() {
+        assert_eq!(clock_cmd(CLOCK_CMD + 1), Some(ClockCmd::Timer(1)));
+        assert_eq!(clock_cmd(CLOCK_CMD + 60), Some(ClockCmd::Timer(60)));
+        assert_eq!(clock_cmd(CLOCK_STOPWATCH), Some(ClockCmd::Stopwatch));
+        assert_eq!(clock_cmd(CLOCK_STOP), Some(ClockCmd::Stop));
+        assert_eq!(clock_cmd(CLOCK_CMD + 7), None);
+        // None of the ids collides with the plain menu items or the size presets.
+        let sizes = SIZE_CMD + SIZE_MIN as usize..=SIZE_CMD + SIZE_MAX as usize;
+        for id in [CLOCK_STOPWATCH, CLOCK_STOP, ALERTS_CMD].into_iter().chain(CLOCK_MINUTES.iter().map(|m| CLOCK_CMD + *m as usize)) {
+            assert!(!sizes.contains(&id) && id > 5, "id {id}");
+        }
+    }
 
     #[test]
     fn screen_state() {

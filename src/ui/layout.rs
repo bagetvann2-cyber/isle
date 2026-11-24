@@ -68,14 +68,15 @@ impl Rect {
     }
 }
 
-/// Pill width for the given (fully present) device item widths.
-pub fn target_width(items: &[f32], wave: bool) -> f32 {
+/// Pill width for the given (fully present) device item widths; `extra` is room kept free at the
+/// right end (the clock segment). Without devices the pill keeps its minimum width.
+pub fn target_width(items: &[f32], wave: bool, extra: f32) -> f32 {
     if items.is_empty() {
         return MIN_W;
     }
     let n = items.len() as f32;
     let gap = if wave { MIN_DIV_LEFT_GAP_WAVE } else { MIN_DIV_LEFT_GAP };
-    let need = LEFT_END + gap + 1.0 + DIV_GAP + items.iter().sum::<f32>() + DEV_GAP * (n - 1.0) + PAD;
+    let need = LEFT_END + gap + 1.0 + DIV_GAP + items.iter().sum::<f32>() + DEV_GAP * (n - 1.0) + PAD + extra;
     need.clamp(MIN_W, MAX_W)
 }
 
@@ -231,13 +232,16 @@ mod tests {
     #[test]
     fn widths() {
         for wave in [false, true] {
-            assert_eq!(target_width(&[], wave), MIN_W);
-            assert_eq!(target_width(&[69.0, 82.0], wave), MIN_W); // 78% + charging 92%
-            assert!(target_width(&[95.0, 95.0, 95.0], wave) > MIN_W);
-            assert!(target_width(&[95.0, 95.0, 95.0], wave) <= MAX_W);
+            assert_eq!(target_width(&[], wave, 0.0), MIN_W);
+            assert_eq!(target_width(&[], wave, 90.0), MIN_W);
+            assert_eq!(target_width(&[69.0, 82.0], wave, 0.0), MIN_W); // 78% + charging 92%
+            assert!(target_width(&[95.0, 95.0, 95.0], wave, 0.0) > MIN_W);
+            assert!(target_width(&[95.0, 95.0, 95.0], wave, 90.0) <= MAX_W);
+            // The clock segment widens a pill that has devices.
+            assert!(target_width(&[95.0, 95.0, 95.0], false, 20.0) > target_width(&[95.0, 95.0, 95.0], false, 0.0));
         }
         // The waveform needs its own room only when devices crowd the pill.
-        assert!(target_width(&[95.0, 95.0, 95.0], true) > target_width(&[95.0, 95.0, 95.0], false));
+        assert!(target_width(&[95.0, 95.0, 95.0], true, 0.0) > target_width(&[95.0, 95.0, 95.0], false, 0.0));
         assert!(BARS_L + BARS_W < text_l(true));
     }
 

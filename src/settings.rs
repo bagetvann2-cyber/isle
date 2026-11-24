@@ -104,3 +104,12 @@ pub fn size_pct() -> u32 {
 pub fn set_size_pct(p: u32) {
     set_u32(w!("size_pct"), p);
 }
+
+/// Alert banners (device connected / low battery / power / timer); on by default.
+pub fn alerts() -> bool {
+    get_u32(w!("alerts")).unwrap_or(1) != 0
+}
+
+pub fn set_alerts(on: bool) {
+    set_u32(w!("alerts"), on as u32);
+}

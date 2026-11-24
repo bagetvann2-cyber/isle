@@ -1,6 +1,4 @@
 //! Timer / stopwatch state. Pure: every function takes `now` (ms, `GetTickCount64` base).
-// TODO(coder2): remove when wired
-#![allow(dead_code)]
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Clock {
@@ -34,6 +32,20 @@ pub fn remaining_ms(c: &Clock, now: u64) -> Option<u64> {
 
 pub fn expired(c: &Clock, now: u64) -> bool {
     remaining_ms(c, now) == Some(0)
+}
+
+/// Milliseconds until the label next changes (always 1..=1000), so a one-shot timer re-armed with it
+/// keeps the display on the second boundary instead of drifting behind it.
+pub fn next_tick_ms(c: &Clock, now: u64) -> u64 {
+    match *c {
+        Clock::Off => 1000,
+        // The label counts ceil(remaining): it drops exactly when the remainder hits a whole second.
+        Clock::Timer { deadline_ms, .. } => match deadline_ms.saturating_sub(now) % 1000 {
+            0 => 1000,
+            r => r,
+        },
+        Clock::Stopwatch { start_ms } => 1000 - now.saturating_sub(start_ms) % 1000,
+    }
 }
 
 #[cfg(test)]
@@ -71,6 +83,20 @@ mod tests {
         assert_eq!(label(&c, 0), "00:00"); // clock never runs backwards into a panic
         assert_eq!(remaining_ms(&c, 5_000), None);
         assert!(!expired(&c, u64::MAX));
+    }
+
+    #[test]
+    fn tick_aligns_to_the_label_change() {
+        let t = timer(10_000);
+        assert_eq!(next_tick_ms(&t, 0), 1000);
+        assert_eq!(next_tick_ms(&t, 1), 999); // remaining 9999: label drops to 9 after 999 ms
+        assert_eq!(next_tick_ms(&t, 9_400), 600);
+        assert_eq!(next_tick_ms(&t, 20_000), 1000); // expired
+        let s = Clock::Stopwatch { start_ms: 1_000 };
+        assert_eq!(next_tick_ms(&s, 1_000), 1000);
+        assert_eq!(next_tick_ms(&s, 1_250), 750);
+        assert_eq!(next_tick_ms(&s, 0), 1000);
+        assert_eq!(next_tick_ms(&Clock::Off, 5), 1000);
     }
 
     #[test]

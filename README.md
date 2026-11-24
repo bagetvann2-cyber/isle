@@ -12,6 +12,9 @@ A tiny Dynamic-Island-style pill for Windows: what's playing, and the battery of
 - **Media**: cover, title, artist, progress and play / pause / prev / next and seek back / forward 10 s for any app that shows up in the Windows media controls (Spotify, Yandex Music, browsers, Media Player...).
 - **Waveform**: six bars next to the play control that move with the sound actually coming out of your speakers, tinted with the cover's colour (grey when there is no cover). Switch it off in the menu.
 - **Batteries**: wireless headphones, earbuds (left / right / case), mice, keyboards, Xbox controllers. Percent turns green with a bolt while charging, red at 15% or less.
+- **Alerts**: a one-line banner slides out for 3 s when a device connects (with left / right / case levels for earbuds), when a device drops to 15% or 5%, when you plug in or unplug the charger of a laptop, and when the laptop battery falls to 20% or 10%. It reveals the island even when it is hidden, then goes away again. Switch them off with **Notifications** in the menu.
+- **Timer and stopwatch**: **Timer** in the menu (1, 5, 10, 15, 25, 60 min) or **Stopwatch** puts a `mm:ss` label at the right end of the pill. When a timer ends, a banner stays (with the system notification sound) until you click it. Click the label while the island is expanded to stop the clock.
+- **Privacy dots**: a small orange dot on the cover's corner while an app uses the microphone, a green one for the camera. Expand the island to see which apps.
 - **Hover** to expand, **drag** to move it, **right-click** (or the tray icon) for the menu.
 - **Auto-hide**: invisible and click-through until the cursor comes near it. Hides while a fullscreen app is in front.
 - Spring animations, paced to your display refresh and only while something moves.
@@ -55,7 +58,7 @@ Download `isle.exe` from the Releases page and run it. It is unsigned, so Window
 - Click the cover for next track, the play / pause glyph to toggle.
 - In the expanded pill, the circular-arrow **10** buttons jump 10 seconds back / forward, and clicking the progress bar seeks to that point. Seeking works only in players that allow it in the Windows media controls; otherwise the buttons are dimmed.
 - Drag to reposition (saved); "Reset position" in the menu puts it back.
-- Right-click the pill or the tray icon: **Start with Windows**, **Always visible** (turns auto-hide off), **Show waveform**, **Size**, **Reset position**, **Exit**. Left-clicking the tray icon shows the island for a few seconds.
+- Right-click the pill or the tray icon: **Start with Windows**, **Always visible** (turns auto-hide off), **Show waveform**, **Notifications**, **Timer** (1-60 min, stopwatch, stop), **Size**, **Reset position**, **Exit**. Left-clicking the tray icon shows the island for a few seconds.
 - Size: the **Size** submenu offers 75 / 85 / 100 / 115 / 130 %, or hold **Ctrl** and scroll over the pill (5 % per notch, 60-150 %). It applies live and is saved. The default is 85 %.
 
 ## Build from source
@@ -75,11 +78,13 @@ A source is one module in `src/battery/` with `fn poll() -> Vec<Device>` (see `b
 
 ## Privacy
 
-No network access. It reads device batteries, the Windows media session and the output peak level of your default playback device (a single number from the Windows audio meter, used for the waveform; it never records or reads audio), nothing else, and writes nothing to your devices (the Logitech source sends read-only queries; the gamepad source only reads the Windows battery report). Position, size, the always-visible flag and the waveform flag live in `HKCU\Software\isle`; autostart is the `isle` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+No network access. It reads device batteries, the Windows media session and the output peak level of your default playback device (a single number from the Windows audio meter, used for the waveform; it never records or reads audio), nothing else, and writes nothing to your devices (the Logitech source sends read-only queries; the gamepad source only reads the Windows battery report). Position, size, the always-visible flag, the waveform flag and the notifications flag live in `HKCU\Software\isle`; autostart is the `isle` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 
 To know when the cursor approaches the island, isle installs a global low-level mouse hook (`WH_MOUSE_LL`). It only compares the cursor position with a small rectangle and posts a message when the cursor enters or leaves it; it reads nothing else and logs nothing. The hook is removed while a fullscreen app is in front and when "Always visible" is on.
 
 Matching a Fast Pair or AirPods advert to your headset is heuristic (signal strength plus agreement with the Windows battery level), so a neighbour's earbuds could in rare cases be shown; Xiaomi / Redmi buds are matched exactly by MAC address.
+
+The privacy dots read Windows' own capability-access records for the current user (`HKCU\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore`, the same data behind the microphone / camera indicator in Windows Settings). It only watches that registry key for changes; there are no hooks into other apps, and nothing is recorded or sent anywhere. Laptop power alerts use the standard Windows power notifications and `GetSystemPowerStatus`; on a PC without a battery they stay silent.
 
 ## License
 
