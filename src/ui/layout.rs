@@ -101,34 +101,43 @@ pub fn expand_down(top: i32, scale: f32, extra_logical: f32, work_top: i32, work
 pub struct Geo {
     pub cover: Rect,
     pub pp1: (f32, f32),
+    pub back: (f32, f32),
     pub prev: (f32, f32),
     pub pp2: (f32, f32),
     pub next: (f32, f32),
+    pub fwd: (f32, f32),
     pub title: Rect,
     pub artist: Rect,
     pub elapsed: Rect,
     pub bar: Rect,
+    /// Click target for seeking: the bar widened to a comfortable height.
+    pub bar_hit: Rect,
     pub remaining: Rect,
 }
 
 pub fn geo(left: f32, width: f32, row1: f32, block: f32) -> Geo {
     let cy1 = row1 + PILL_H / 2.0;
     let right = left + width - PAD;
-    let next = (right - 16.0, block + 27.0);
-    let pp2 = (next.0 - 36.0, next.1);
-    let prev = (pp2.0 - 36.0, next.1);
-    let text_r = (prev.0 - 24.0).max(left + PAD + 40.0);
+    let fwd = (right - 16.0, block + 27.0);
+    let next = (fwd.0 - 34.0, fwd.1);
+    let pp2 = (next.0 - 34.0, fwd.1);
+    let prev = (pp2.0 - 34.0, fwd.1);
+    let back = (prev.0 - 34.0, fwd.1);
+    let text_r = (back.0 - 22.0).max(left + PAD + 40.0);
     let bar_y = block + 64.0;
     Geo {
         cover: Rect::new(left + PAD, cy1 - 26.0, 52.0, 52.0),
         pp1: (left + 98.0 + 8.5, cy1),
+        back,
         prev,
         pp2,
         next,
+        fwd,
         title: Rect { l: left + PAD, t: block + 8.0, r: text_r, b: block + 28.0 },
         artist: Rect { l: left + PAD, t: block + 28.0, r: text_r, b: block + 46.0 },
         elapsed: Rect { l: left + PAD, t: bar_y - 9.0, r: left + PAD + 36.0, b: bar_y + 9.0 },
         bar: Rect { l: left + PAD + 44.0, t: bar_y - 1.5, r: right - 46.0, b: bar_y + 1.5 },
+        bar_hit: Rect { l: left + PAD + 40.0, t: bar_y - 10.0, r: right - 42.0, b: bar_y + 10.0 },
         remaining: Rect { l: right - 40.0, t: bar_y - 9.0, r: right, b: bar_y + 9.0 },
     }
 }

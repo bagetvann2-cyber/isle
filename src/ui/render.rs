@@ -50,6 +50,8 @@ pub enum Ctl {
     Prev,
     Play2,
     Next,
+    Back,
+    Fwd,
 }
 
 /// Waveform state: bar heights 0..1 and the (cover-derived) base colour; `None` = neutral grey.
@@ -80,6 +82,7 @@ pub struct Frame {
     pub playing_w: f32, // weight of the *pause* shape (1 = playing)
     pub can_prev: bool,
     pub can_next: bool,
+    pub can_seek: bool,
     pub cover: Option<Arc<Cover>>,
     pub prev_cover: Option<Arc<Cover>>,
     pub cover_t: f32,
@@ -161,6 +164,10 @@ pub struct Renderer {
     small_r: IDWriteTextFormat,
     ico24: IDWriteTextFormat,
     ico20: IDWriteTextFormat,
+    tiny: IDWriteTextFormat,
+    /// Circular skip arrow (forward orientation, radius 9, centred on the origin): open arc + filled head.
+    skip_arc: ID2D1PathGeometry,
+    skip_head: ID2D1PathGeometry,
     cur: Option<CoverBmp>,
     prev: Option<CoverBmp>,
     ph: Option<CoverBmp>,
@@ -304,6 +311,27 @@ impl Renderer {
             sink.EndFigure(D2D1_FIGURE_END_CLOSED);
             sink.Close()?;
 
+            // Skip arrow: 300 degree clockwise arc from -40 to -100 degrees, head past the end.
+            let skip_arc = d2d.CreatePathGeometry()?;
+            let sink = skip_arc.Open()?;
+            sink.BeginFigure(Vector2 { X: 6.894, Y: -5.785 }, D2D1_FIGURE_BEGIN_HOLLOW);
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: Vector2 { X: -1.563, Y: -8.863 },
+                size: D2D_SIZE_F { width: 9.0, height: 9.0 },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_LARGE,
+            });
+            sink.EndFigure(D2D1_FIGURE_END_OPEN);
+            sink.Close()?;
+            let skip_head = d2d.CreatePathGeometry()?;
+            let sink = skip_head.Open()?;
+            sink.BeginFigure(Vector2 { X: 2.6, Y: -9.6 }, D2D1_FIGURE_BEGIN_FILLED);
+            sink.AddLine(Vector2 { X: -1.1, Y: -5.9 });
+            sink.AddLine(Vector2 { X: -2.1, Y: -11.9 });
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink.Close()?;
+
             let ui = if font_exists(&dw, w!("Segoe UI Variable Display")) { w!("Segoe UI Variable Display") } else { w!("Segoe UI") };
             let ic = if font_exists(&dw, w!("Segoe Fluent Icons")) { w!("Segoe Fluent Icons") } else { w!("Segoe MDL2 Assets") };
             let title = format(&dw, ui, 15.0, 600)?;
@@ -317,6 +345,9 @@ impl Renderer {
             let small = format(&dw, ui, 11.0, 400)?;
             let small_r = format(&dw, ui, 11.0, 400)?;
             small_r.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
+            let tiny = format(&dw, ui, 8.5, 700)?;
+            tiny.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            tiny.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             let icon = |sz| -> windows::core::Result<IDWriteTextFormat> {
                 let f = format(&dw, ic, sz, 400)?;
                 f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
@@ -331,6 +362,9 @@ impl Renderer {
                 small_r,
                 ico24: icon(28.0)?,
                 ico20: icon(20.0)?,
+                tiny,
+                skip_arc,
+                skip_head,
                 d2d,
                 dw,
                 rt,
@@ -549,6 +583,21 @@ impl Renderer {
             }
         }
         self.set_xf(None);
+    }
+
+    /// Circular skip arrow with "10" inside, centred on (cx, cy); `fwd` = clockwise (forward), else mirrored.
+    fn skip10(&self, cx: f32, cy: f32, fwd: bool, press: f32, hex: u32, a: f32) {
+        let local = Matrix3x2 { M11: if fwd { 1.0 } else { -1.0 }, M12: 0.0, M21: 0.0, M22: 1.0, M31: cx, M32: cy };
+        let m = mul(&local, &mul(&scale_about(press, cx, cy), &mul(&self.group, &self.base)));
+        // SAFETY: valid pointers for the call.
+        unsafe {
+            self.rt.SetTransform(&m);
+            let b = self.color(hex, a);
+            self.rt.DrawGeometry(&self.skip_arc, b, 1.6, &self.stroke);
+            self.rt.FillGeometry(&self.skip_head, b, None::<&ID2D1Brush>);
+        }
+        self.set_xf(Some((press, cx, cy)));
+        self.text("10", &self.tiny, Rect::around(cx, cy + 0.5, 16.0, 12.0), hex, a);
     }
 
     /// Charging bolt centred on (cx, cy); `w` fades and scales it in (0.6 -> 1).
@@ -992,6 +1041,9 @@ impl Renderer {
         }
         // Transport.
         let yo = |p: (f32, f32)| (p.0, p.1 + dy);
+        let seek_a = c * dim(f.can_seek);
+        let (bx, by) = yo(g.back);
+        self.skip10(bx, by, false, Self::press_of(f, Ctl::Back), 0xF2F2F2, seek_a);
         let (px, py) = yo(g.prev);
         self.set_xf(Some((Self::press_of(f, Ctl::Prev), px, py)));
         self.glyph(&self.ico20, '\u{E892}', px, py, 0xF2F2F2, c * dim(f.can_prev));
@@ -1000,6 +1052,8 @@ impl Renderer {
         let (nx, ny) = yo(g.next);
         self.set_xf(Some((Self::press_of(f, Ctl::Next), nx, ny)));
         self.glyph(&self.ico20, '\u{E893}', nx, ny, 0xF2F2F2, c * dim(f.can_next));
+        let (fx, fy) = yo(g.fwd);
+        self.skip10(fx, fy, true, Self::press_of(f, Ctl::Fwd), 0xF2F2F2, seek_a);
         self.set_xf(None);
         // Progress.
         if let Some((frac, el, rem)) = &f.progress {
@@ -1118,6 +1172,38 @@ impl Renderer {
                 );
             }
         }
+    }
+
+    /// Test aid: write the presented DIB as a 24-bit BMP, composited over mid-grey so the pill is visible.
+    pub fn dump_bmp(&self, path: &std::path::Path) {
+        if self.bits.is_null() {
+            return;
+        }
+        let (w, h) = (self.w as usize, self.h as usize);
+        let row = (w * 3).div_ceil(4) * 4;
+        let mut out = Vec::with_capacity(54 + row * h);
+        out.extend_from_slice(b"BM");
+        out.extend_from_slice(&((54 + row * h) as u32).to_le_bytes());
+        out.extend_from_slice(&[0; 4]);
+        out.extend_from_slice(&54u32.to_le_bytes());
+        out.extend_from_slice(&40u32.to_le_bytes());
+        out.extend_from_slice(&(w as i32).to_le_bytes());
+        out.extend_from_slice(&(h as i32).to_le_bytes()); // bottom-up
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&24u16.to_le_bytes());
+        out.extend_from_slice(&[0; 24]);
+        for y in (0..h).rev() {
+            for x in 0..w {
+                // SAFETY: in bounds of the w * h * 4 byte DIB.
+                let p = unsafe { std::slice::from_raw_parts(self.bits.add((y * w + x) * 4), 4) };
+                let inv = 255 - p[3] as u32;
+                for c in &p[..3] {
+                    out.push((*c as u32 + 0x50 * inv / 255).min(255) as u8);
+                }
+            }
+            out.resize(out.len() + (row - w * 3), 0);
+        }
+        let _ = std::fs::write(path, out);
     }
 
     /// Push the DIB to the layered window at screen position (x, y).
