@@ -56,7 +56,7 @@ Download `isle.exe` from the Releases page and run it. It is unsigned, so Window
 
 ## Usage
 
-- Move the cursor near the top-center of the screen to reveal it; hover the pill to expand it.
+- Move the cursor near the top-center of the screen to reveal it; hover the pill to expand it. When the island sits at a screen edge, push the cursor into that edge (or rest it on the island for a moment) to reveal it — moving past it to browser tabs won't pop it up.
 - Click the cover for next track, the play / pause glyph to toggle.
 - In the expanded pill, the circular-arrow **10** buttons jump 10 seconds back / forward, and clicking the progress bar seeks to that point. Seeking works only in players that allow it in the Windows media controls; otherwise the buttons are dimmed.
 - Drag to reposition (saved); "Reset position" in the menu puts it back.

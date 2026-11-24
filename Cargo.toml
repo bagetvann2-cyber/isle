@@ -1,6 +1,6 @@
 [package]
 name = "isle"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "A tiny Dynamic-Island-style pill for Windows: current media and wireless device batteries."
 license = "MIT"

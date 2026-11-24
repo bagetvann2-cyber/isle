@@ -8,6 +8,7 @@ mod banner;
 pub mod layout;
 mod liquid;
 mod render;
+mod reveal;
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicPtr, AtomicU32, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -51,6 +52,7 @@ use banner::Item;
 use layout::*;
 use liquid::{choose_edge, edge_line, shape, Edge, IRect, RestBox};
 use render::{BannerDraw, ClockDraw, Ctl, DevDraw, Frame, Liquid, PartsRow, PrivLine, Renderer, WaveDraw};
+use reveal::{Ev, Reveal};
 
 pub const WM_APP_MEDIA: u32 = WM_APP + 1;
 pub const WM_APP_DEVICES: u32 = WM_APP + 2;
@@ -91,6 +93,8 @@ const T_CLOCK_DUE: usize = 9;
 const T_TEST: usize = 10;
 /// One-shot: time for the next update check (first 60 s after start, then 1 h x3 while nothing is found, then every 24 h).
 const T_UPDATE: usize = 11;
+/// One-shot: the cursor dwelled long enough to reveal the island (armed on enter, killed on leave).
+const T_DWELL: usize = 12;
 const CHECK_FIRST_MS: u32 = 60_000;
 const CHECK_EVERY_MS: u32 = 24 * 3_600_000;
 /// How long a banner stays up; update banners get longer, they are worth reading.
@@ -129,9 +133,19 @@ fn scale_for(dpi: u32, size_pct: u32) -> f32 {
 const EDGE_GAP: f32 = 12.0;
 /// Reveal zone padding around the compact pill, logical px.
 const ZONE_PAD: f32 = 28.0;
-/// Zone rect (l, t, r, b, physical px) shared with the low-level mouse hook proc.
-static ZONE: [AtomicI32; 4] = [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)];
+type AtomicRect = [AtomicI32; 4];
+const fn atomic_rect() -> AtomicRect {
+    [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)]
+}
+/// Rects (l, t, r, b, physical px) shared with the low-level mouse hook proc: the hold zone (the
+/// padded pill, reaching the edge when docked), the compact rest rect (inside the zone) and the
+/// hot strip on the screen edge (empty unless docked; also inside the zone).
+static ZONE: AtomicRect = atomic_rect();
+static REST: AtomicRect = atomic_rect();
+static STRIP: AtomicRect = atomic_rect();
 static INSIDE: AtomicBool = AtomicBool::new(false);
+static IN_REST: AtomicBool = AtomicBool::new(false);
+static IN_STRIP: AtomicBool = AtomicBool::new(false);
 static HOOK_HWND: AtomicIsize = AtomicIsize::new(0);
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -407,6 +421,8 @@ struct App {
     tray_icon: Option<HICON>,
     always_visible: bool,
     zone_active: bool,
+    /// Cursor-reveal state machine (see `reveal`).
+    rv: Reveal,
     mouse_hook: Option<HHOOK>,
     hinst: HINSTANCE,
     shown: bool,
@@ -546,6 +562,7 @@ impl App {
             tray_icon: None,
             always_visible: settings::always_visible(),
             zone_active: false,
+            rv: Reveal::default(),
             mouse_hook: None,
             hinst: HINSTANCE::default(),
             shown: false,
@@ -641,8 +658,10 @@ impl App {
         self.update_zone();
     }
 
-    /// Reveal zone for the hook proc: the compact pill (or the expanded one) inflated by 24 px.
-    fn update_zone(&self) {
+    /// Rects for the hook proc: the compact pill (or the expanded one) inflated by `ZONE_PAD` is the
+    /// hold zone; the compact pill alone is the rest rect. At a screen edge the zone also reaches the
+    /// edge and a hot strip there is the reveal trigger.
+    fn update_zone(&mut self) {
         let s = self.scale;
         let pad = (ZONE_PAD * s).round() as i32;
         let left = self.pill_left();
@@ -650,16 +669,32 @@ impl App {
         let h = (PILL_H * s).round() as i32;
         let extra = if self.want_exp { ((EXP_H - PILL_H + PART_ROW_H * self.rows_t.target()) * s).round() as i32 } else { 0 };
         let (top, bottom) = if self.up { (self.top_y - extra, self.top_y + h) } else { (self.top_y, self.top_y + h + extra) };
-        for (a, v) in ZONE.iter().zip([left - pad, top - pad, left + w + pad, bottom + pad]) {
-            a.store(v, Ordering::Relaxed);
+        let rest = IRect { l: left, t: self.top_y, r: left + w, b: self.top_y + h };
+        let mut zone = IRect { l: left - pad, t: top - pad, r: left + w + pad, b: bottom + pad };
+        let mut strip = reveal::EMPTY;
+        let dock = self.dock_edge(rest);
+        if let Some((e, work, mon)) = dock {
+            strip = reveal::edge_strip(e, mon, work, rest, pad);
+            zone = reveal::union(zone, strip);
+        }
+        self.rv.docked = dock.is_some();
+        for (a, r) in [(&ZONE, zone), (&REST, rest), (&STRIP, strip)] {
+            for (a, v) in a.iter().zip([r.l, r.t, r.r, r.b]) {
+                a.store(v, Ordering::Relaxed);
+            }
         }
     }
 
-    fn point_in_zone(x: i32, y: i32) -> bool {
-        x >= ZONE[0].load(Ordering::Relaxed)
-            && y >= ZONE[1].load(Ordering::Relaxed)
-            && x < ZONE[2].load(Ordering::Relaxed)
-            && y < ZONE[3].load(Ordering::Relaxed)
+    fn in_rect(a: &AtomicRect, x: i32, y: i32) -> bool {
+        x >= a[0].load(Ordering::Relaxed)
+            && y >= a[1].load(Ordering::Relaxed)
+            && x < a[2].load(Ordering::Relaxed)
+            && y < a[3].load(Ordering::Relaxed)
+    }
+
+    /// The cursor revealed the island and has left it: click-through until the hide delay passes.
+    fn click_through(&self) -> bool {
+        self.rv.revealed && !self.rv.in_zone && !self.alert_active && !self.always_visible && !self.menu_open && self.drag.is_none()
     }
 
     // ---- animation driver ----
@@ -1157,7 +1192,7 @@ bar {} {} {}
     // ---- hit-testing ----
 
     fn hit_at(&self, px: i32, py: i32) -> Hit {
-        if !self.shown || self.vis.target == 0.0 {
+        if !self.shown || self.vis.target == 0.0 || self.click_through() {
             return Hit::Outside;
         }
         let s = self.scale;
@@ -1369,6 +1404,7 @@ bar {} {} {}
     /// `drag` was taken (and capture released) by the caller, outside any `&mut App`.
     fn on_lbutton_up(&mut self, drag: Option<Drag>) {
         let Some(d) = drag else { return };
+        self.resume_hide();
         if self.press_ctl.is_some() {
             self.press.target = 1.0;
             self.press.tune(0.30, 0.55);
@@ -1786,6 +1822,14 @@ bar {} {} {}
             r: ox + (pill.r * s).round() as i32,
             b: oy + (pill.b * s).round() as i32,
         };
+        let (e, work, _) = self.dock_edge(rest)?;
+        Some((e, edge_line(e, work)))
+    }
+
+    /// The screen edge an island resting at `rest` is docked to (the one `choose_edge` picks), with the
+    /// monitor's work area and full rect. `None`: not at an edge.
+    fn dock_edge(&self, rest: IRect) -> Option<(Edge, IRect, IRect)> {
+        let s = self.scale;
         let r = RECT { left: rest.l, top: rest.t, right: rest.r, bottom: rest.b };
         // SAFETY: plain monitor queries with valid pointers.
         let (work, mon) = unsafe {
@@ -1801,26 +1845,66 @@ bar {} {} {}
         let min_gap = (liquid::MIN_GAP * s).round() as i32;
         // SAFETY: point query only.
         let other = |x, y| unsafe { !MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONULL).is_invalid() };
-        let e = choose_edge(rest, work, mon, hc, min_gap, other)?;
-        Some((e, edge_line(e, work)))
+        choose_edge(rest, work, mon, hc, min_gap, other).map(|e| (e, work, mon))
     }
 
-    /// Cursor entered / left the reveal zone (posted by the mouse hook).
-    fn on_zone(&mut self, inside: bool) {
+    /// A cursor event from the mouse hook or a timer: run the reveal state machine.
+    fn on_reveal(&mut self, ev: Ev) {
+        let (st, act) = reveal::step(self.rv, ev);
+        self.rv = st;
+        if ev == Ev::LeaveZone {
+            self.request_collapse(Instant::now());
+        }
+        // SAFETY: timers on our own window.
+        unsafe {
+            match act {
+                reveal::Act::None => {}
+                reveal::Act::Keep => {
+                    let _ = KillTimer(Some(self.hwnd), T_HIDE);
+                }
+                reveal::Act::Reveal => {
+                    let _ = KillTimer(Some(self.hwnd), T_HIDE);
+                    let _ = KillTimer(Some(self.hwnd), T_DWELL);
+                    let was = self.zone_active;
+                    self.zone_active = true;
+                    self.apply_visibility();
+                    if !was {
+                        self.reoffer_update();
+                    }
+                }
+                reveal::Act::Hide(ms) => {
+                    SetTimer(Some(self.hwnd), T_HIDE, ms, None);
+                }
+                reveal::Act::ArmDwell(ms) => {
+                    SetTimer(Some(self.hwnd), T_DWELL, ms, None);
+                }
+                reveal::Act::CancelDwell => {
+                    let _ = KillTimer(Some(self.hwnd), T_DWELL);
+                }
+            }
+        }
+    }
+
+    /// A menu or drag held back the hide: start it now if the cursor is away.
+    fn resume_hide(&mut self) {
+        if self.rv.revealed && !self.rv.in_zone {
+            // SAFETY: timer on our own window.
+            unsafe {
+                SetTimer(Some(self.hwnd), T_HIDE, reveal::HIDE_MS, None);
+            }
+        }
+    }
+
+    /// The hide delay is over (or a tray / startup reveal ran out): hide unless the cursor holds it.
+    fn on_hide_timer(&mut self) {
         // SAFETY: timer on our own window.
         unsafe {
-            if inside {
-                let _ = KillTimer(Some(self.hwnd), T_HIDE);
-                let was = self.zone_active;
-                self.zone_active = true;
-                self.apply_visibility();
-                if !was {
-                    self.reoffer_update();
-                }
-            } else {
-                self.request_collapse(Instant::now());
-                SetTimer(Some(self.hwnd), T_HIDE, 600, None);
-            }
+            let _ = KillTimer(Some(self.hwnd), T_HIDE);
+        }
+        if !self.menu_open && self.drag.is_none() {
+            self.rv = reveal::step(self.rv, Ev::HideDone).0;
+            self.zone_active = self.rv.revealed;
+            self.apply_visibility();
         }
     }
 
@@ -1843,8 +1927,24 @@ bar {} {} {}
         }
         let mut p = POINT::default();
         // SAFETY: valid out pointer.
-        let inside = unsafe { GetCursorPos(&mut p).is_ok() } && Self::point_in_zone(p.x, p.y);
+        let ok = unsafe { GetCursorPos(&mut p).is_ok() };
+        let inside = ok && Self::in_rect(&ZONE, p.x, p.y);
         INSIDE.store(inside, Ordering::Relaxed);
+        IN_REST.store(inside && Self::in_rect(&REST, p.x, p.y), Ordering::Relaxed);
+        IN_STRIP.store(inside && Self::in_rect(&STRIP, p.x, p.y), Ordering::Relaxed);
+        self.rv.in_zone = inside;
+        if !inside {
+            // Nothing holds a cursor reveal any more (the hook was off meanwhile).
+            if self.rv.revealed {
+                self.zone_active = false;
+            }
+            self.rv.revealed = false;
+            self.rv.dwell = false;
+            // SAFETY: timer on our own window.
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), T_DWELL);
+            }
+        }
     }
 
     /// Add (or refresh) the notification-area icon.
@@ -1889,6 +1989,8 @@ bar {} {} {}
     /// Show the island for a few seconds (tray click), like the startup reveal.
     fn reveal_for(&mut self, ms: u32) {
         self.zone_active = true;
+        // This reveal ends on its own timer, not on the cursor.
+        self.rv.revealed = false;
         // SAFETY: timer on our own window.
         unsafe {
             SetTimer(Some(self.hwnd), T_HIDE, ms, None);
@@ -2632,14 +2734,26 @@ fn make_tray_icon(n: i32) -> Option<HICON> {
     }
 }
 
-/// Low-level mouse hook: runs on every mouse move system-wide, so it only compares the
-/// point with the cached zone rect and posts when the inside/outside state flips.
+/// Low-level mouse hook: runs on every mouse move system-wide, so it only compares the point
+/// with the cached rects and posts when the zone / rest / edge-strip state flips. The rest rect and
+/// the strip lie inside the zone, so outside it one compare is all there is.
 unsafe extern "system" fn mouse_ll(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code == 0 && wp.0 as u32 == WM_MOUSEMOVE {
         let pt = (*(lp.0 as *const MSLLHOOKSTRUCT)).pt;
-        let inside = App::point_in_zone(pt.x, pt.y);
-        if inside != INSIDE.swap(inside, Ordering::Relaxed) {
-            let _ = PostMessageW(Some(HWND(HOOK_HWND.load(Ordering::Relaxed) as *mut _)), WM_APP_ZONE, WPARAM(inside as usize), LPARAM(0));
+        let post = |ev: Ev| {
+            let _ = PostMessageW(Some(HWND(HOOK_HWND.load(Ordering::Relaxed) as *mut _)), WM_APP_ZONE, WPARAM(ev as usize), LPARAM(0));
+        };
+        let zone = App::in_rect(&ZONE, pt.x, pt.y);
+        if zone != INSIDE.swap(zone, Ordering::Relaxed) {
+            post(if zone { Ev::EnterZone } else { Ev::LeaveZone });
+        }
+        let rest = zone && App::in_rect(&REST, pt.x, pt.y);
+        if rest != IN_REST.swap(rest, Ordering::Relaxed) {
+            post(if rest { Ev::EnterRest } else { Ev::LeaveRest });
+        }
+        let strip = zone && App::in_rect(&STRIP, pt.x, pt.y);
+        if strip != IN_STRIP.swap(strip, Ordering::Relaxed) && strip {
+            post(Ev::EdgeTouch);
         }
     }
     CallNextHookEx(None, code, wp, lp)
@@ -2717,6 +2831,7 @@ unsafe fn show_menu(hwnd: HWND) {
     let _ = DestroyMenu(menu);
     let a = app();
     a.menu_open = false;
+    a.resume_hide();
     match cmd.0 {
         1 => settings::set_autostart(!settings::autostart_enabled()),
         2 => a.reset_position(),
@@ -2724,10 +2839,9 @@ unsafe fn show_menu(hwnd: HWND) {
             a.always_visible = !a.always_visible;
             settings::set_always_visible(a.always_visible);
             a.sync_hook(false);
-            a.zone_active = INSIDE.load(Ordering::Relaxed);
-            if !a.zone_active {
-                SetTimer(Some(hwnd), T_HIDE, 600, None);
-            }
+            // The cursor is on the island (the menu came from it): it stays until the cursor leaves.
+            a.rv.revealed = a.rv.in_zone;
+            a.zone_active = a.rv.revealed;
             a.apply_visibility();
         }
         5 => {
@@ -2857,12 +2971,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         }
                     }
                 }
-                T_HIDE => {
-                    let _ = KillTimer(Some(hwnd), T_HIDE);
-                    if !a.menu_open && a.drag.is_none() {
-                        a.zone_active = INSIDE.load(Ordering::Relaxed);
-                        a.apply_visibility();
-                    }
+                T_HIDE => a.on_hide_timer(),
+                T_DWELL => {
+                    let _ = KillTimer(Some(hwnd), T_DWELL);
+                    a.on_reveal(Ev::DwellDone);
                 }
                 T_DEVCHANGE => {
                     let _ = KillTimer(Some(hwnd), T_DEVCHANGE);
@@ -2903,7 +3015,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_APP_ZONE => {
-            app().on_zone(wp.0 != 0);
+            if let Some(ev) = Ev::from_code(wp.0) {
+                app().on_reveal(ev);
+            }
+            LRESULT(0)
+        }
+        // The taskbar moved or resized: the work area (and with it the docked edge) changed.
+        WM_SETTINGCHANGE if wp.0 == SPI_SETWORKAREA.0 as usize => {
+            app().update_zone();
             LRESULT(0)
         }
         WM_APP_FOREGROUND => {

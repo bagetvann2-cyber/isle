@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "isle"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "hidapi",
  "serde_json",
