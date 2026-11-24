@@ -1,5 +1,7 @@
 # isle
 
+English | [Русский](README.ru.md)
+
 A tiny Dynamic-Island-style pill for Windows: what's playing, and the battery of your wireless gear, in one small black capsule at the top of the screen.
 
 ![compact](docs/screenshot-compact.png)
@@ -76,17 +78,6 @@ No network access. It reads device batteries, the Windows media session and the 
 To know when the cursor approaches the island, isle installs a global low-level mouse hook (`WH_MOUSE_LL`). It only compares the cursor position with a small rectangle and posts a message when the cursor enters or leaves it; it reads nothing else and logs nothing. The hook is removed while a fullscreen app is in front and when "Always visible" is on.
 
 Matching a Fast Pair or AirPods advert to your headset is heuristic (signal strength plus agreement with the Windows battery level), so a neighbour's earbuds could in rare cases be shown; Xiaomi / Redmi buds are matched exactly by MAC address.
-
-## Кратко по-русски
-
-Маленькая «капсула» в стиле Dynamic Island для Windows: что сейчас играет и заряд беспроводных устройств (наушники с отдельным зарядом левого/правого/кейса, мышь, клавиатура).
-
-- Запустите `isle.exe` из Releases. Файл не подписан: в SmartScreen нажмите «Подробнее» → «Выполнить в любом случае».
-- Капсула прячется и появляется, когда курсор рядом. Наведите курсор, чтобы раскрыть. Перетаскивайте мышью.
-- Правый клик по капсуле или значку в трее: «Запускать вместе с Windows», «Всегда показывать», «Показывать волну», «Сбросить позицию», «Выход».
-- Чтобы понять, что курсор рядом, используется глобальный хук мыши (только позиция курсора, ничего не логируется). Антивирус или античит могут ругаться на неподписанное приложение с таким хуком.
-- Нагрузка: около 0% CPU в покое, около 1% одного ядра при видимой капсуле и играющей музыке (волна), около 11-12 МБ памяти, файл около 0,65 МБ. Сети нет, устройства только читаются. Волна, опрос Bluetooth-наушников и таймер прогресса приостанавливаются, пока экран выключен или ПК заблокирован.
-- Сборка: Rust (`x86_64-pc-windows-gnu`) и MinGW-w64, затем `cargo build --release`.
 
 ## License
 
