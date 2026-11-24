@@ -129,11 +129,16 @@ fn app() -> &'static mut App {
     unsafe { &mut *APP.load(Ordering::Acquire) }
 }
 
+/// Step of the back/forward buttons.
+const SEEK_STEP_MS: i64 = 10_000;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Hit {
     Outside,
     Pill,
     Ctl(Ctl),
+    /// The progress bar's seek strip (expanded, seekable only).
+    Bar,
 }
 
 struct Drag {
@@ -729,6 +734,7 @@ impl App {
             has_media: m.is_some(),
             playing_w: self.pp_t.val(now),
             can_prev: m.is_some_and(|m| m.can_prev),
+            can_seek: m.is_some_and(|m| m.can_seek && m.duration_ms > 0),
             can_next: m.is_some_and(|m| m.can_next),
             cover: m.and_then(|m| m.cover.clone()),
             prev_cover: self.prev_cover.clone(),
@@ -801,6 +807,32 @@ impl App {
         let t1 = Instant::now();
         r.present(self.hwnd, self.win_x, self.win_y());
         self.perf_present += t1.elapsed().as_secs_f64() * 1000.0;
+        if test_knob("ISLE_TEST_DUMP") && f.content >= 0.99 && f.has_media && f.progress.is_some() {
+            static DUMPED: AtomicBool = AtomicBool::new(false);
+            if !DUMPED.swap(true, Ordering::Relaxed) {
+                if let Some(d) = std::env::var_os("ISLE_TEST_DUMP") {
+                    r.dump_bmp(std::path::Path::new(&d));
+                    // Screen px of the seek controls, for injected-click tests.
+                    let g = self.geometry().2;
+                    let sx = |x: f32| self.win_x as f32 + x * self.scale;
+                    let sy = |y: f32| self.win_y() as f32 + (y + 0.0) * self.scale;
+                    let txt = format!(
+                        "back {} {}
+fwd {} {}
+bar {} {} {}
+",
+                        sx(g.back.0) as i32,
+                        sy(g.back.1) as i32,
+                        sx(g.fwd.0) as i32,
+                        sy(g.fwd.1) as i32,
+                        sx(g.bar.l) as i32,
+                        sx(g.bar.r) as i32,
+                        sy((g.bar.t + g.bar.b) / 2.0) as i32
+                    );
+                    let _ = std::fs::write(std::path::Path::new(&d).with_extension("txt"), txt);
+                }
+            }
+        }
         self.r = Some(r);
         if self.anim_running {
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -821,12 +853,19 @@ impl App {
             return Hit::Outside;
         }
         let near = |p: (f32, f32)| Rect::around(p.0, p.1, 32.0, 32.0).contains(x, y);
+        let seekable = self.media.as_ref().is_some_and(|m| m.can_seek && m.duration_ms > 0);
         if g.cover.contains(x, y) {
             Hit::Ctl(Ctl::Cover)
         } else if near(g.pp1) {
             Hit::Ctl(Ctl::Play1)
         } else if self.content.target() == 1.0 && self.open.x > 0.9 {
-            if near(g.prev) {
+            if seekable && near(g.back) {
+                Hit::Ctl(Ctl::Back)
+            } else if seekable && near(g.fwd) {
+                Hit::Ctl(Ctl::Fwd)
+            } else if seekable && g.bar_hit.contains(x, y) {
+                Hit::Bar
+            } else if near(g.prev) {
                 Hit::Ctl(Ctl::Prev)
             } else if near(g.pp2) {
                 Hit::Ctl(Ctl::Play2)
@@ -845,6 +884,8 @@ impl App {
             Ctl::Cover | Ctl::Next => MediaCommand::Next,
             Ctl::Prev => MediaCommand::Prev,
             Ctl::Play1 | Ctl::Play2 => MediaCommand::TogglePlay,
+            Ctl::Back => MediaCommand::SeekBy(-SEEK_STEP_MS),
+            Ctl::Fwd => MediaCommand::SeekBy(SEEK_STEP_MS),
         };
         if let Some(m) = &self.media_tx {
             m.send(cmd);
@@ -1020,6 +1061,21 @@ impl App {
             if self.hit_at(p.x, p.y) == d.hit {
                 self.command(c);
             }
+        } else if d.hit == Hit::Bar {
+            let mut p = POINT::default();
+            // SAFETY: valid out pointer.
+            unsafe {
+                let _ = GetCursorPos(&mut p);
+            }
+            if self.hit_at(p.x, p.y) == Hit::Bar {
+                let bar = self.geometry().2.bar;
+                let x = (p.x - self.win_x) as f32 / self.scale;
+                let dur = self.media.as_ref().map_or(0, |m| m.duration_ms);
+                let to = (((x - bar.l) / bar.w()).clamp(0.0, 1.0) * dur as f32) as u64;
+                if let Some(m) = &self.media_tx {
+                    m.send(MediaCommand::SeekTo(to));
+                }
+            }
         }
         if !self.cursor_in_pill() {
             self.on_leave();
@@ -1075,6 +1131,7 @@ impl App {
                     || o.playing != n.playing
                     || o.can_prev != n.can_prev
                     || o.can_next != n.can_next
+                    || o.can_seek != n.can_seek
                     || o.duration_ms != n.duration_ms
                     || self.want_exp
             }
@@ -1396,7 +1453,7 @@ fn perf_log(line: &str) {
 }
 
 /// Test switches (env vars) only exist in debug builds; release builds ignore them.
-fn test_knob(name: &str) -> bool {
+pub(crate) fn test_knob(name: &str) -> bool {
     cfg!(debug_assertions) && std::env::var_os(name).is_some()
 }
 

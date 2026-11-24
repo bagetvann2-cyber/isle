@@ -53,7 +53,7 @@ fn main() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _mutex = CreateMutexW(None, false, w!(r"Local\isle-single-instance"));
-        if GetLastError() == ERROR_ALREADY_EXISTS {
+        if GetLastError() == ERROR_ALREADY_EXISTS && !ui::test_knob("ISLE_TEST_NO_MUTEX") {
             return;
         }
         let _ = ui::run();

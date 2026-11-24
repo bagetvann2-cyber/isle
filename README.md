@@ -9,7 +9,7 @@ A tiny Dynamic-Island-style pill for Windows: what's playing, and the battery of
 
 ## Features
 
-- **Media**: cover, title, artist, progress and play / pause / prev / next for any app that shows up in the Windows media controls (Spotify, Yandex Music, browsers, Media Player...).
+- **Media**: cover, title, artist, progress and play / pause / prev / next and seek back / forward 10 s for any app that shows up in the Windows media controls (Spotify, Yandex Music, browsers, Media Player...).
 - **Waveform**: six bars next to the play control that move with the sound actually coming out of your speakers, tinted with the cover's colour (grey when there is no cover). Switch it off in the menu.
 - **Batteries**: wireless headphones, earbuds (left / right / case), mice, keyboards, Xbox controllers. Percent turns green with a bolt while charging, red at 15% or less.
 - **Hover** to expand, **drag** to move it, **right-click** (or the tray icon) for the menu.
@@ -53,6 +53,7 @@ Download `isle.exe` from the Releases page and run it. It is unsigned, so Window
 
 - Move the cursor near the top-center of the screen to reveal it; hover the pill to expand it.
 - Click the cover for next track, the play / pause glyph to toggle.
+- In the expanded pill, the circular-arrow **10** buttons jump 10 seconds back / forward, and clicking the progress bar seeks to that point. Seeking works only in players that allow it in the Windows media controls; otherwise the buttons are dimmed.
 - Drag to reposition (saved); "Reset position" in the menu puts it back.
 - Right-click the pill or the tray icon: **Start with Windows**, **Always visible** (turns auto-hide off), **Show waveform**, **Reset position**, **Exit**. Left-clicking the tray icon shows the island for a few seconds.
 

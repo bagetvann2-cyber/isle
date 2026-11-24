@@ -96,7 +96,7 @@ fn run(hwnd: isize, shared: &Shared, rx: mpsc::Receiver<Msg>, tx: Sender<Msg>) -
         match rx.recv() {
             Ok(Msg::Dirty { props: p }) => props |= p,
             Ok(Msg::Cmd(c)) => {
-                w.command(c);
+                w.command(hwnd, shared, c);
                 continue;
             }
             Err(_) => return Ok(()),
@@ -104,7 +104,7 @@ fn run(hwnd: isize, shared: &Shared, rx: mpsc::Receiver<Msg>, tx: Sender<Msg>) -
         loop {
             match rx.recv_timeout(DEBOUNCE) {
                 Ok(Msg::Dirty { props: p }) => props |= p,
-                Ok(Msg::Cmd(c)) => w.command(c),
+                Ok(Msg::Cmd(c)) => w.command(hwnd, shared, c),
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => return Ok(()),
             }
@@ -114,12 +114,41 @@ fn run(hwnd: isize, shared: &Shared, rx: mpsc::Receiver<Msg>, tx: Sender<Msg>) -
 }
 
 impl Worker {
-    fn command(&self, c: MediaCommand) {
+    fn command(&self, hwnd: isize, shared: &Shared, c: MediaCommand) {
         let Some(s) = &self.sub else { return };
         let _ = match c {
             MediaCommand::TogglePlay => s.session.TryTogglePlayPauseAsync().map(|_| ()),
             MediaCommand::Next => s.session.TrySkipNextAsync().map(|_| ()),
             MediaCommand::Prev => s.session.TrySkipPreviousAsync().map(|_| ()),
+            MediaCommand::SeekBy(_) | MediaCommand::SeekTo(_) => {
+                let now = Instant::now();
+                let target = match shared.media.lock() {
+                    Ok(g) => match (&*g, c) {
+                        (Some(m), MediaCommand::SeekBy(d)) if m.duration_ms > 0 => m.seek_by_target(d, now),
+                        (Some(m), MediaCommand::SeekTo(t)) if m.duration_ms > 0 => t.min(m.duration_ms),
+                        _ => return,
+                    },
+                    Err(_) => return,
+                };
+                // The position is relative to the timeline start, which `read` subtracted: add it back.
+                let start = s.session.GetTimelineProperties().and_then(|t| t.StartTime()).map_or(0, |t| t.Duration.max(0));
+                let ticks = start.saturating_add(target as i64 * 10_000);
+                let ok = s.session.TryChangePlaybackPositionAsync(ticks).and_then(|op| op.join()).unwrap_or(false);
+                if ok {
+                    // Jump the bar now; TimelinePropertiesChanged will correct it.
+                    if let Ok(mut g) = shared.media.lock() {
+                        if let Some(m) = g.as_mut() {
+                            m.position_ms = target;
+                            m.position_at = Some(Instant::now());
+                        }
+                    }
+                    // SAFETY: posting to a window handle; failure just means the window is gone.
+                    unsafe {
+                        let _ = PostMessageW(Some(HWND(hwnd as *mut _)), WM_APP_MEDIA, WPARAM(0), LPARAM(0));
+                    }
+                }
+                Ok(())
+            }
         };
     }
 
@@ -237,6 +266,7 @@ impl Worker {
             playing,
             can_prev: ctl.IsPreviousEnabled().unwrap_or(false),
             can_next: ctl.IsNextEnabled().unwrap_or(false),
+            can_seek: ctl.IsPlaybackPositionEnabled().unwrap_or(false),
             position_ms,
             duration_ms,
             position_at: Some(Instant::now()),
