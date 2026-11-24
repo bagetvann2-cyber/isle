@@ -29,6 +29,8 @@ pub enum Alert {
     /// Banner-only states of a user-started install; the UI shows them itself, they never enter the queue.
     Updating,
     UpdateFailed,
+    /// The new exe is on disk but could not be started: the user restarts isle by hand.
+    UpdateInstalled,
 }
 
 const CONNECT_COOLDOWN_MS: u64 = 60_000;
@@ -159,7 +161,7 @@ fn ttl(a: &Alert) -> Option<u64> {
         Alert::TimerDone => None,
         // Offered for 5 min; if the island could not show it by then, the menu item is still there.
         Alert::UpdateAvailable { .. } => Some(TTL_LONG_MS),
-        Alert::Updating | Alert::UpdateFailed => Some(TTL_SHORT_MS),
+        Alert::Updating | Alert::UpdateFailed | Alert::UpdateInstalled => Some(TTL_SHORT_MS),
     }
 }
 
@@ -172,7 +174,8 @@ fn same_slot(a: &Alert, b: &Alert) -> bool {
         | (LaptopLow { .. }, LaptopLow { .. })
         | (TimerDone, TimerDone)
         | (Updating, Updating)
-        | (UpdateFailed, UpdateFailed) => true,
+        | (UpdateFailed, UpdateFailed)
+        | (UpdateInstalled, UpdateInstalled) => true,
         // Only the newest offer matters: a newer version replaces a queued older one.
         (UpdateAvailable { .. }, UpdateAvailable { .. }) => true,
         _ => false,

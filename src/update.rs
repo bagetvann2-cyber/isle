@@ -148,6 +148,23 @@ fn parse_sha256_hex(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+const RELEASES_PREFIX: &str = "https://github.com/bagetvann2-cyber/isle/releases/";
+const RELEASES_FALLBACK: &str = "https://github.com/bagetvann2-cyber/isle/releases/latest";
+
+/// The URL to hand to the shell: `url` if it is a page of our releases (no whitespace, control or non-ASCII bytes),
+/// else the releases-latest page. The URL comes from the GitHub API, so it is untrusted.
+pub fn safe_page_url(url: &str) -> &str {
+    let ok = url.len() <= MAX_URL
+        && url.starts_with(RELEASES_PREFIX)
+        && url.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b'\\' && b != b'%')
+        && !url.split(['/', '?', '#']).any(|s| s == "." || s == "..");
+    if ok {
+        url
+    } else {
+        RELEASES_FALLBACK
+    }
+}
+
 pub fn parse_latest(json: &str) -> Result<Release, Error> {
     let v: serde_json::Value = serde_json::from_str(json).map_err(|_| Error::Parse("invalid JSON"))?;
     let tag = v["tag_name"].as_str().filter(|t| t.len() <= 64).ok_or(Error::Parse("tag_name"))?;
@@ -541,6 +558,26 @@ mod tests {
         assert!(parse_latest("not json").is_err());
         assert!(parse_latest("{}").is_err());
         assert!(parse_latest(r#"{"tag_name":"nightly","html_url":"","assets":[]}"#).is_err());
+    }
+
+    #[test]
+    fn safe_page_url_validates() {
+        assert_eq!(safe_page_url(HTML), HTML);
+        for bad in [
+            "https://github.com/other/isle/releases/tag/v0.3.0",
+            "https://github.com/bagetvann2-cyber/isle/issues/1",
+            "https://github.com/bagetvann2-cyber/isle/releases",
+            "http://github.com/bagetvann2-cyber/isle/releases/tag/v1",
+            "javascript:alert(1)",
+            "https://github.com/bagetvann2-cyber/isle/releases/../../../evil/x",
+            "https://github.com/bagetvann2-cyber/isle/releases/%2e%2e/%2e%2e/evil/x",
+            "https://github.com/bagetvann2-cyber/isle/releases/tag/v1 evil",
+            "https://github.com/bagetvann2-cyber/isle/releases/tag/v1\nx",
+            "https://github.com/bagetvann2-cyber/isle/releases/tag/v1\\x",
+            "",
+        ] {
+            assert_eq!(safe_page_url(bad), RELEASES_FALLBACK, "{bad:?}");
+        }
     }
 
     #[test]

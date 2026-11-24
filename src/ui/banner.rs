@@ -140,7 +140,20 @@ pub fn banner_items(a: &Alert, dev: Option<&Device>, timer_total_ms: u64, ru: bo
         }
         Alert::Updating => vec![Item::Glyph('\u{E895}', LIGHT), text(if ru { "Обновление\u{2026}" } else { "Updating\u{2026}" }, WHITE)],
         Alert::UpdateFailed => {
-            vec![Item::Glyph('\u{E7BA}', ORANGE), text(if ru { "Не удалось обновить" } else { "Update failed" }, WHITE)]
+            let s = if ru {
+                "Не удалось обновить \u{B7} открыть страницу"
+            } else {
+                "Update failed \u{B7} open page"
+            };
+            vec![Item::Glyph('\u{E7BA}', ORANGE), text(s, WHITE)]
+        }
+        Alert::UpdateInstalled => {
+            let s = if ru {
+                "Обновление установлено \u{2014} перезапустите isle"
+            } else {
+                "Update installed \u{2014} restart isle"
+            };
+            vec![Item::Glyph('\u{E73E}', LIGHT), text(s, WHITE)]
         }
     }
 }
@@ -291,8 +304,9 @@ mod tests {
         assert_eq!(texts(&banner_items(&a, None, 0, false)), vec![("Update 0.3.0 available \u{B7} click".into(), WHITE)]);
         assert_eq!(texts(&banner_items(&Alert::Updating, None, 0, true))[0].0, "Обновление\u{2026}");
         assert_eq!(texts(&banner_items(&Alert::Updating, None, 0, false))[0].0, "Updating\u{2026}");
-        assert_eq!(texts(&banner_items(&Alert::UpdateFailed, None, 0, true))[0].0, "Не удалось обновить");
-        assert_eq!(texts(&banner_items(&Alert::UpdateFailed, None, 0, false))[0].0, "Update failed");
+        assert_eq!(texts(&banner_items(&Alert::UpdateFailed, None, 0, true))[0].0, "Не удалось обновить \u{B7} открыть страницу");
+        assert_eq!(texts(&banner_items(&Alert::UpdateFailed, None, 0, false))[0].0, "Update failed \u{B7} open page");
+        assert_eq!(texts(&banner_items(&Alert::UpdateInstalled, None, 0, false))[0].0, "Update installed \u{2014} restart isle");
     }
 
     #[test]

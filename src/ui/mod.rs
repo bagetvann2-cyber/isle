@@ -32,8 +32,8 @@ use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVE
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::Shell::{
-    SHQueryUserNotificationState, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
-    QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
+    SHQueryUserNotificationState, ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NOTIFYICONDATAW, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -185,6 +185,7 @@ pub enum InstallResult {
 enum UpdateUi {
     Working,
     Failed,
+    Installed,
 }
 
 /// Append a line to the debug log (`ISLE_PERF` knob, debug builds only; release builds log nothing).
@@ -208,7 +209,7 @@ fn post_update(sh: &Shared, hw: isize, m: UpdateMsg) {
 /// How long `a` stays on the banner before it goes (sticky ones never time out).
 fn alert_ms(a: &Alert) -> u32 {
     match a {
-        Alert::UpdateAvailable { .. } | Alert::UpdateFailed => UPDATE_ALERT_MS,
+        Alert::UpdateAvailable { .. } | Alert::UpdateFailed | Alert::UpdateInstalled => UPDATE_ALERT_MS,
         _ => ALERT_MS,
     }
 }
@@ -1894,6 +1895,7 @@ const CLOCK_STOP: usize = 481;
 const ALERTS_CMD: usize = 6;
 /// Menu ids: install the known update, toggle the daily update check.
 const UPDATE_CMD: usize = 8;
+const UPDATE_PAGE_CMD: usize = 12;
 const CHECK_CMD: usize = 9;
 
 fn clock_cmd(id: usize) -> Option<ClockCmd> {
@@ -1947,6 +1949,7 @@ impl App {
             // The install's own banner: user-started, so independent of the notifications switch.
             Some(UpdateUi::Working) if self.screen.active() && !self.fs_hidden => Some(Alert::Updating),
             Some(UpdateUi::Failed) if self.screen.active() && !self.fs_hidden => Some(Alert::UpdateFailed),
+            Some(UpdateUi::Installed) if self.screen.active() && !self.fs_hidden => Some(Alert::UpdateInstalled),
             _ => self.queue.current(now_ms(), can).cloned(),
         };
         let changed = match head {
@@ -2077,7 +2080,24 @@ impl App {
                     self.start_update();
                 }
             }
+            Some(Alert::UpdateFailed) => {
+                // Same grace as the offer: this banner replaces the one that was under the cursor.
+                if self.banner.as_ref().is_some_and(|b| b.shown_at.elapsed() >= UPDATE_CLICK_GRACE) {
+                    self.open_update_page();
+                    self.finish_alert();
+                }
+            }
             _ => self.finish_alert(),
+        }
+    }
+
+    /// Manual fallback: open the release page of the known update in the default browser.
+    fn open_update_page(&self) {
+        let url = self.update_rel.as_ref().map_or("", |r| r.page_url.as_str());
+        let wurl = wide0(update::safe_page_url(url));
+        // SAFETY: `wurl` is a live NUL-terminated buffer; no window owns the call.
+        unsafe {
+            ShellExecuteW(None, w!("open"), PCWSTR(wurl.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
         }
     }
 
@@ -2209,10 +2229,11 @@ impl App {
                 }
                 UpdateMsg::Installed(InstallResult::Restarted) => return true,
                 UpdateMsg::Installed(r) => {
-                    if matches!(r, InstallResult::SwappedNoRestart) {
+                    let swapped = matches!(r, InstallResult::SwappedNoRestart);
+                    if swapped {
                         self.update_rel = None; // already on disk: do not offer (and redo) it
                     }
-                    self.update_ui = Some(UpdateUi::Failed);
+                    self.update_ui = Some(if swapped { UpdateUi::Installed } else { UpdateUi::Failed });
                     self.sync_alerts();
                 }
             }
@@ -2577,9 +2598,11 @@ unsafe fn show_menu(hwnd: HWND) {
         .update_rel
         .as_ref()
         .map(|r| wide0(&if ru { format!("Обновить до {}", r.version) } else { format!("Update to {}", r.version) }));
+    let t_page = tr("Открыть страницу обновления", "Open update page");
     if let Some(t) = &t_upd {
         let f = if app().update_ui == Some(UpdateUi::Working) { MF_STRING | MF_GRAYED } else { MF_STRING };
         let _ = AppendMenuW(menu, f, UPDATE_CMD, PCWSTR(t.as_ptr()));
+        let _ = AppendMenuW(menu, MF_STRING, UPDATE_PAGE_CMD, PCWSTR(t_page.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     }
     let (a, b, c, d, e) = (wide0(t_auto), wide0(t_reset), wide0(t_exit), wide0(t_vis), wide0(t_wave));
@@ -2660,6 +2683,7 @@ unsafe fn show_menu(hwnd: HWND) {
             a.sync_alerts();
         }
         c if c as usize == UPDATE_CMD => a.start_update(),
+        c if c as usize == UPDATE_PAGE_CMD => a.open_update_page(),
         c if c as usize == CHECK_CMD => {
             a.update_on = !a.update_on;
             settings::set_check_updates(a.update_on);
