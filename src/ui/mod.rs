@@ -89,7 +89,7 @@ const T_CLOCK_TICK: usize = 8;
 const T_CLOCK_DUE: usize = 9;
 /// Debug-only: drives the scripted alert tests (`ISLE_TEST_FAKE_CONNECT`, `ISLE_TEST_POWER`).
 const T_TEST: usize = 10;
-/// One-shot: time for the next update check (first 60 s after start, then every 24 h, re-armed after each check).
+/// One-shot: time for the next update check (first 60 s after start, then 1 h x3 while nothing is found, then every 24 h).
 const T_UPDATE: usize = 11;
 const CHECK_FIRST_MS: u32 = 60_000;
 const CHECK_EVERY_MS: u32 = 24 * 3_600_000;
@@ -99,6 +99,25 @@ const UPDATE_ALERT_MS: u32 = 6000;
 const UPDATE_CLICK_GRACE: Duration = Duration::from_millis(700);
 /// A failed check is retried after this (the network may simply not be up yet).
 const CHECK_RETRY_MS: u32 = 3_600_000;
+/// The first checks after start that find nothing are repeated hourly (a stale CDN answer right after a release).
+const QUICK_RECHECKS: u32 = 3;
+/// A known update is re-offered on a cursor reveal at most this often.
+const REOFFER_MS: u64 = 10 * 60_000;
+
+/// Delay until the next check: errors and the first few empty answers retry in 1 h, otherwise 24 h.
+/// `nones` counts the empty answers so far (this one included), 0 after a found release.
+fn next_check_ms(ok: bool, nones: u32) -> u32 {
+    if !ok || (1..=QUICK_RECHECKS).contains(&nones) {
+        CHECK_RETRY_MS
+    } else {
+        CHECK_EVERY_MS
+    }
+}
+
+/// Whether a cursor reveal may show the update offer again.
+fn reoffer_due(last: Option<u64>, now: u64, window: u64) -> bool {
+    last.is_none_or(|t| now.saturating_sub(t) >= window)
+}
 /// Connect alerts are muted this long after resume / unlock (devices reappear then).
 const MUTE_MS: u64 = 15_000;
 
@@ -423,6 +442,10 @@ struct App {
     update_rel: Option<Release>,
     /// The last version announced with a banner: each version is announced once per run.
     update_offered: Option<Version>,
+    /// `GetTickCount64` of the last update banner pushed (first offer or re-offer).
+    offer_at: Option<u64>,
+    /// Checks that found nothing so far.
+    none_checks: u32,
     update_ui: Option<UpdateUi>,
     check_busy: bool,
     /// `GetTickCount64` of the last finished check.
@@ -547,6 +570,8 @@ impl App {
             update_on: settings::check_updates(),
             update_rel: None,
             update_offered: None,
+            offer_at: None,
+            none_checks: 0,
             update_ui: None,
             check_busy: false,
             last_check: None,
@@ -1786,8 +1811,12 @@ bar {} {} {}
         unsafe {
             if inside {
                 let _ = KillTimer(Some(self.hwnd), T_HIDE);
+                let was = self.zone_active;
                 self.zone_active = true;
                 self.apply_visibility();
+                if !was {
+                    self.reoffer_update();
+                }
             } else {
                 self.request_collapse(Instant::now());
                 SetTimer(Some(self.hwnd), T_HIDE, 600, None);
@@ -2178,8 +2207,25 @@ impl App {
         let alert = Alert::UpdateAvailable { version: rel.version.to_string() };
         self.update_rel = Some(rel);
         if announce {
+            self.offer_at = Some(now_ms());
             self.push_alerts(vec![alert]);
         }
+    }
+
+    /// The island was revealed by the cursor: show the known update offer again, at most once per `REOFFER_MS`.
+    fn reoffer_update(&mut self) {
+        let Some(rel) = self.update_rel.as_ref().filter(|_| self.update_on) else { return };
+        let window = std::env::var("ISLE_TEST_REOFFER_MS").ok().and_then(|v| v.parse().ok()).filter(|_| cfg!(debug_assertions));
+        if self.update_ui.is_some() || !reoffer_due(self.offer_at, now_ms(), window.unwrap_or(REOFFER_MS)) {
+            return;
+        }
+        self.offer_at = Some(now_ms());
+        debug_log(
+            "update re-offered
+",
+        );
+        let alert = Alert::UpdateAvailable { version: rel.version.to_string() };
+        self.push_alerts(vec![alert]);
     }
 
     /// Install `update_rel` after an explicit click. Never called without one.
@@ -2233,8 +2279,13 @@ impl App {
                     if found.is_ok() {
                         self.last_check = Some(now_ms());
                     }
+                    if matches!(found, Ok(None)) {
+                        self.none_checks += 1;
+                    } else if found.is_ok() {
+                        self.none_checks = 0;
+                    }
                     if self.update_on {
-                        self.arm_update_check(if found.is_ok() { CHECK_EVERY_MS } else { CHECK_RETRY_MS });
+                        self.arm_update_check(next_check_ms(found.is_ok(), self.none_checks));
                     }
                     if let Ok(Some(rel)) = found {
                         self.on_release_found(rel);
@@ -3091,6 +3142,19 @@ mod tests {
         assert!(want_shown(false, false, false, true), "an alert reveals a hidden island");
         // A fullscreen app overrides every reason, alerts included.
         assert!(!want_shown(true, true, true, true));
+    }
+
+    #[test]
+    fn update_schedule() {
+        assert_eq!(next_check_ms(false, 0), CHECK_RETRY_MS);
+        assert_eq!(next_check_ms(true, 0), CHECK_EVERY_MS); // found a release
+        for n in 1..=3 {
+            assert_eq!(next_check_ms(true, n), CHECK_RETRY_MS);
+        }
+        assert_eq!(next_check_ms(true, 4), CHECK_EVERY_MS);
+        assert!(reoffer_due(None, 5, 600));
+        assert!(!reoffer_due(Some(100), 699, 600));
+        assert!(reoffer_due(Some(100), 700, 600));
     }
 
     #[test]
