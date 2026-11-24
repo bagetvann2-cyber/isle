@@ -35,6 +35,8 @@ A tiny Dynamic-Island-style pill for Windows: what's playing, and the battery of
 
 No real mouse has been tested yet: Bluetooth mice should work through the Windows battery property; Logitech is untested.
 
+New in 0.3.0 and so far tested only with simulated events: the device-connected / low-battery / laptop-power notifications, the camera and microphone dots, and the timer sound. If one of them misbehaves on your PC, please open an issue.
+
 Earbud parts come from a passive Bluetooth scan that listens only for the connected headset's vendor format. It runs continuously while the island is expanded, continuously for the first minute after it appears and then 4 s every 30 s while it stays shown, and once when a headset connects (including at app start). While the island is hidden, nothing is scanned. When both buds are in your ears they stop advertising, so after 30 s of silence the island falls back to the single Windows percent. Charging is only shown where the source reports it (Logitech, Xbox controllers, BLE earbuds).
 
 ## Resource use
